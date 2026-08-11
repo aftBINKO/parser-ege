@@ -1,0 +1,24 @@
+# Секреты и сохранённые сессии — НИКОГДА не коммитим
+.env
+auth_state.json
+*.auth.json
+
+# Скачанные материалы и результаты пайплайна
+downloads/
+images/
+output/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
