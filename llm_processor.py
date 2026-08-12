@@ -105,6 +105,47 @@ SYSTEM_INSTRUCTION = """\
 - Не добавляй в JSON никаких других полей.
 """
 
+#: Инструкция для переписывания условия «под себя».
+#:
+#: Нужна, чтобы разбор на сайте школы не был дословной копией чужого условия.
+#: Переписывание обязано сохранять тип задания и способ решения — иначе выйдет
+#: другая задача, а не переформулированная.
+REWRITE_INSTRUCTION = """\
+Перепиши условие задачи своими словами так, чтобы текст заметно отличался от
+исходного, но задача осталась той же по типу, сложности и способу решения.
+
+ЧТО МЕНЯТЬ МОЖНО И НУЖНО:
+- формулировки предложений, порядок их следования;
+- имена персонажей;
+- порядок перечисления переменных (например, w, x, y, z → x, y, z, w);
+- порядок столбцов или строк в таблице, если это не меняет сути;
+- нейтральные детали оформления.
+
+ЧТО МЕНЯТЬ НЕЛЬЗЯ:
+- тип задания и проверяемое умение;
+- логическую структуру и сложность;
+- числовые данные, если от них зависит ответ.
+
+КРИТИЧЕСКИ ВАЖНО:
+Если перестановка переменных или столбцов меняет правильный ответ — ПЕРЕСЧИТАЙ
+ответ под новую формулировку. Ответ должен соответствовать именно тому условию,
+которое ты написал. Решение и подсказки тоже перепиши под новую формулировку,
+чтобы они ссылались на актуальный порядок переменных.
+
+Верни полный JSON-объект того же формата со всеми пятью полями.
+"""
+
+#: Заголовок блока с образцом оформления.
+STYLE_HINT = """\
+Ниже приведён ОБРАЗЕЦ того, как должен выглядеть разбор: его структура, стиль
+изложения и уровень подробности. Следуй образцу по форме подачи, но содержание
+бери из своей задачи — не копируй числа и выводы образца.
+
+--- ОБРАЗЕЦ ---
+{sample}
+--- КОНЕЦ ОБРАЗЦА ---
+"""
+
 #: Схема ответа для API. Дублирует требования системного промпта на уровне,
 #: который модель нарушить не может: набор полей, их типы и обязательность.
 RESPONSE_SCHEMA = types.Schema(
@@ -351,10 +392,20 @@ class GeminiProcessor:
     # -- внутреннее ---------------------------------------------------------- #
 
     @staticmethod
-    def _build_prompt(raw_text: str, task_id: str | None) -> str:
-        """Собрать пользовательскую часть промпта."""
+    def _build_prompt(
+        raw_text: str, task_id: str | None, style_reference: str = ""
+    ) -> str:
+        """Собрать пользовательскую часть промпта.
+
+        :param style_reference: образец оформления разбора. Если задан, модель
+            получает его вместе с задачей и подражает форме подачи — так первый
+            же вариант выходит в нужном стиле, без правок вручную.
+        """
         header = f"ID задачи: {task_id}\n\n" if task_id else ""
-        return f"{header}Сырой текст задачи:\n<<<\n{raw_text.strip()}\n>>>"
+        prompt = f"{header}Сырой текст задачи:\n<<<\n{raw_text.strip()}\n>>>"
+        if style_reference.strip():
+            prompt = f"{STYLE_HINT.format(sample=style_reference.strip())}\n\n{prompt}"
+        return prompt
 
     @staticmethod
     def _extract_text(response: Any) -> str:
@@ -413,12 +464,20 @@ class GeminiProcessor:
 
     # -- публичный API ------------------------------------------------------- #
 
-    async def process(self, raw_text: str, *, task_id: str | None = None) -> TaskSolution:
+    async def process(
+        self,
+        raw_text: str,
+        *,
+        task_id: str | None = None,
+        style_reference: str = "",
+    ) -> TaskSolution:
         """Обработать одну задачу.
 
         :param raw_text: сырой текст условия из ``scraper.py``.
         :param task_id: известный идентификатор задачи; подставится в результат,
             если модель не вернёт свой.
+        :param style_reference: образец оформления разбора (см.
+            :meth:`_build_prompt`).
         :raises LLMRequestError: сбой обращения к API.
         :raises LLMResponseError: ответ не удалось распарсить/провалидировать.
         """
@@ -426,10 +485,27 @@ class GeminiProcessor:
             raise LLMResponseError("На вход подан пустой текст задачи")
 
         logger.info("Отправляю задачу %s в Gemini", task_id or "<без id>")
-        raw_response = await self._generate(self._build_prompt(raw_text, task_id))
+        raw_response = await self._generate(
+            self._build_prompt(raw_text, task_id, style_reference)
+        )
         solution = parse_llm_json(raw_response, fallback_task_id=task_id)
         logger.info("Задача %s обработана", solution.task_id or "<без id>")
         return solution
+
+    def start_session(
+        self, raw_text: str, solution: TaskSolution, *, style_reference: str = ""
+    ) -> "SolutionSession":
+        """Открыть диалог с моделью вокруг уже полученного разбора.
+
+        Диалог нужен, чтобы править решение репликами («перепиши через
+        перебор», «добавь второй способ»), а не переспрашивать задачу с нуля:
+        модель помнит и условие, и предыдущие версии разбора.
+        """
+        return SolutionSession(
+            self,
+            self._build_prompt(raw_text, solution.task_id, style_reference),
+            solution,
+        )
 
     async def process_many(
         self,
@@ -454,3 +530,117 @@ class GeminiProcessor:
 
         tasks = [worker(task_id, raw_text) for task_id, raw_text in items]
         return await asyncio.gather(*tasks, return_exceptions=return_exceptions)
+
+
+# --------------------------------------------------------------------------- #
+# Диалог по одной задаче
+# --------------------------------------------------------------------------- #
+
+
+class SolutionSession:
+    """Многоходовой диалог с моделью вокруг одного разбора.
+
+    Создаётся через :meth:`GeminiProcessor.start_session`. Модель видит исходную
+    задачу и все предыдущие версии разбора, поэтому правки формулируются
+    репликами: «сделай через перебор в Python», «добавь второй способ»,
+    «вот образец, приведи к такому виду».
+
+    Каждый ответ проходит ту же валидацию, что и первичный разбор, поэтому
+    :attr:`solution` всегда остаётся цельным :class:`TaskSolution`.
+    """
+
+    def __init__(
+        self, processor: GeminiProcessor, prompt: str, solution: TaskSolution
+    ) -> None:
+        self._processor = processor
+        self._prompt = prompt
+        self.solution = solution
+        self.history: list[str] = []
+        self._chat: Any = None
+
+    def _ensure_chat(self) -> Any:
+        """Создать чат, подставив в историю исходную задачу и текущий разбор."""
+        if self._chat is None:
+            self._chat = self._processor._client.aio.chats.create(
+                model=self._processor.model_name,
+                config=self._processor._config,
+                history=[
+                    types.Content(
+                        role="user", parts=[types.Part.from_text(text=self._prompt)]
+                    ),
+                    types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text=self.solution.to_json())],
+                    ),
+                ],
+            )
+        return self._chat
+
+    async def send(self, message: str) -> TaskSolution:
+        """Отправить произвольную реплику и получить обновлённый разбор.
+
+        :raises LLMRequestError: сбой обращения к API.
+        :raises LLMResponseError: ответ не удалось распарсить/провалидировать.
+        """
+        if not message.strip():
+            raise LLMResponseError("Пустая реплика — нечего отправлять модели")
+
+        chat = self._ensure_chat()
+        try:
+            response = await chat.send_message(message)
+        except Exception as exc:  # SDK бросает разнородные исключения
+            raise LLMRequestError(f"Правка не удалась: {exc}") from exc
+
+        text = GeminiProcessor._extract_text(response)
+        self.solution = parse_llm_json(
+            text, fallback_task_id=self.solution.task_id
+        )
+        self.history.append(message)
+        return self.solution
+
+    async def refine(self, instruction: str, sample: str = "") -> TaskSolution:
+        """Поправить разбор по указанию, при желании показав образец.
+
+        :param instruction: что именно изменить.
+        :param sample: образец оформления — «вот как должно быть».
+        """
+        message = instruction.strip()
+        if sample.strip():
+            message = f"{message}\n\n{STYLE_HINT.format(sample=sample.strip())}"
+        return await self.send(message)
+
+    async def rewrite(self, extra_instruction: str = "") -> TaskSolution:
+        """Переписать условие своими словами и пересчитать под него ответ.
+
+        Нужно, чтобы разбор не был дословной копией чужого условия. Результат
+        обязательно проверяйте независимым решением: см.
+        :func:`verify_rewrite`.
+        """
+        message = REWRITE_INSTRUCTION
+        if extra_instruction.strip():
+            message = f"{message}\n\nДополнительно: {extra_instruction.strip()}"
+        return await self.send(message)
+
+
+async def verify_rewrite(
+    processor: GeminiProcessor, solution: TaskSolution
+) -> tuple[bool, str]:
+    """Проверить переписанное условие независимым решением.
+
+    После переписывания ответ с сайта эталоном быть перестаёт: у новой
+    формулировки он может быть другим. Поэтому переписанное условие решается
+    заново — отдельным запросом, без контекста диалога, чтобы модель не
+    подсматривала собственный предыдущий ответ.
+
+    :returns: пара ``(сошлось_ли, ответ_проверки)``.
+    """
+    control = await processor.process(solution.condition, task_id=solution.task_id)
+    matched = control.answer.strip().casefold() == solution.answer.strip().casefold()
+    if not matched:
+        logger.warning(
+            "Проверка переписанного условия задачи %s не сошлась: «%s» против «%s»",
+            solution.task_id,
+            solution.answer,
+            control.answer,
+        )
+    return matched, control.answer

@@ -21,11 +21,19 @@ Gemini идут пачкой, а они и есть самое медленно�
 проверку: расхождение почти всегда означает, что модель ошиблась в решении, и
 публиковать такой разбор вреднее, чем не публиковать ничего.
 
+Порядок шагов здесь принципиален. Сверка идёт сразу после решения — до правок и
+до переписывания условия, потому что ответ с kompege относится к **исходной**
+формулировке. Стоит переставить переменные, и правильный ответ станет другим,
+поэтому переписанный вариант проверяется не эталоном, а независимым повторным
+решением (см. :func:`llm_processor.verify_rewrite`).
+
 Запуск::
 
     python main.py 21401 21402 21403
     python main.py --numbers-file numbers.txt --dry-run
-    python main.py 21401 --skip-upload          # только парсинг и решение
+    python main.py 21401 --skip-upload                  # только парсинг и решение
+    python main.py 21401 --review --style-file s.md     # с ручной правкой
+    python main.py 21401 --rewrite                      # + уникализация условия
 """
 
 from __future__ import annotations
@@ -44,6 +52,7 @@ from typing import Sequence
 from dotenv import load_dotenv
 
 from llm_processor import GeminiProcessor, LLMError, TaskSolution
+from review import ReviewDecision, review_solution
 from scraper import ScrapedTask, ScraperError, TaskScraper
 from uploader import AdminUploader, AuthStateError, UploaderError, UploadResult
 
@@ -56,6 +65,10 @@ DEFAULT_OUTPUT_DIR = Path("output")
 
 #: Файл с задачами, отложенными из-за расхождения ответов.
 DEFAULT_MISMATCH_FILE = Path("output/mismatches.json")
+
+
+class ReviewAborted(Exception):
+    """Пользователь прервал прогон на этапе просмотра."""
 
 
 # --------------------------------------------------------------------------- #
@@ -109,6 +122,11 @@ class PipelineReport:
         return [item for item in self.outcomes if item.stage == "compare"]
 
     @property
+    def rejected(self) -> list[TaskOutcome]:
+        """Задачи, отклонённые вручную при просмотре."""
+        return [item for item in self.outcomes if item.stage == "review"]
+
+    @property
     def failed(self) -> list[TaskOutcome]:
         """Задачи, упавшие с ошибкой."""
         return [
@@ -119,12 +137,15 @@ class PipelineReport:
 
     def summary(self) -> str:
         """Короткая сводка для лога."""
-        return (
-            f"всего {len(self.outcomes)}, "
-            f"опубликовано {len(self.published)}, "
-            f"расхождений {len(self.mismatched)}, "
-            f"ошибок {len(self.failed)}"
-        )
+        parts = [
+            f"всего {len(self.outcomes)}",
+            f"опубликовано {len(self.published)}",
+            f"расхождений {len(self.mismatched)}",
+            f"ошибок {len(self.failed)}",
+        ]
+        if self.rejected:
+            parts.insert(-1, f"отклонено вручную {len(self.rejected)}")
+        return ", ".join(parts)
 
 
 # --------------------------------------------------------------------------- #
@@ -167,6 +188,9 @@ class Pipeline:
     :param uploader: загрузчик в админку; ``None`` — публикация пропускается.
     :param output_dir: куда сохранять готовые разборы.
     :param llm_concurrency: сколько задач держать в модели одновременно.
+    :param review: показывать каждый разбор на правку перед публикацией.
+    :param rewrite: переписывать условие своими словами (антиплагиат).
+    :param style_reference: образец оформления разбора для модели.
     """
 
     def __init__(
@@ -177,11 +201,17 @@ class Pipeline:
         *,
         output_dir: Path = DEFAULT_OUTPUT_DIR,
         llm_concurrency: int = 3,
+        review: bool = False,
+        rewrite: bool = False,
+        style_reference: str = "",
     ) -> None:
         self.scraper = scraper
         self.processor = processor
         self.uploader = uploader
         self.output_dir = Path(output_dir)
+        self.review = review
+        self.rewrite = rewrite
+        self.style_reference = style_reference
 
         # Скрапер и загрузчик — однопоточные ресурсы: одна HTTP-сессия и одна
         # вкладка браузера соответственно. Модель — единственное место, где
@@ -205,7 +235,9 @@ class Pipeline:
         """
         async with self._llm_limit:
             return await self.processor.process(
-                task.build_prompt_text(), task_id=task.task_id
+                task.build_prompt_text(),
+                task_id=task.task_id,
+                style_reference=self.style_reference,
             )
 
     async def _publish(self, solution: TaskSolution) -> UploadResult:
@@ -249,6 +281,8 @@ class Pipeline:
 
         path = self._save_solution(solution)
 
+        # Сверка идёт ДО правок: эталон с сайта относится к исходной
+        # формулировке, а после переписывания условия он уже не применим.
         if not answers_match(solution.answer, task.site_answer):
             logger.warning(
                 "Задача %s: расхождение ответов (модель «%s», сайт «%s») — не публикую",
@@ -265,6 +299,41 @@ class Pipeline:
                 task.site_answer,
                 path,
             )
+
+        # Правка и уникализация — после сверки: дальше эталона уже нет.
+        if self.review or self.rewrite:
+            review_result = await review_solution(
+                self.processor,
+                solution,
+                raw_text=task.build_prompt_text(),
+                site_answer=task.site_answer,
+                style_reference=self.style_reference,
+                auto_rewrite=self.rewrite,
+            )
+            solution = review_result.solution
+            path = self._save_solution(solution)
+
+            if review_result.decision == ReviewDecision.QUIT:
+                raise ReviewAborted(f"прогон остановлен на задаче {number}")
+            if review_result.decision == ReviewDecision.REJECT:
+                logger.info("Задача %s отклонена вручную — не публикую", number)
+                return TaskOutcome(
+                    number, "review", False, "отклонена при просмотре",
+                    solution.answer, task.site_answer, path,
+                )
+            if review_result.rewritten and review_result.verified is False:
+                logger.warning(
+                    "Задача %s: переписанное условие не прошло контрольное решение "
+                    "(«%s» против «%s») — откладываю",
+                    number,
+                    solution.answer,
+                    review_result.control_answer,
+                )
+                return TaskOutcome(
+                    number, "compare", False,
+                    "контрольное решение переписанного условия не сошлось",
+                    solution.answer, review_result.control_answer, path,
+                )
 
         if self.uploader is None:
             return TaskOutcome(
@@ -289,6 +358,18 @@ class Pipeline:
         :raises AuthStateError: сессия админки истекла — прогон останавливается.
         """
         report = PipelineReport()
+
+        # С ручным просмотром параллелить нечего: человек всё равно смотрит
+        # задачи по одной, а перемешанный вывод в терминале только мешает.
+        if self.review or self.rewrite:
+            for number in numbers:
+                try:
+                    report.outcomes.append(await self.handle(number))
+                except ReviewAborted as exc:
+                    logger.warning("%s", exc)
+                    break
+            return report
+
         tasks = [asyncio.create_task(self.handle(number)) for number in numbers]
 
         try:
@@ -340,6 +421,8 @@ def print_report(report: PipelineReport) -> None:
             mark, note = "✓", item.message or "опубликовано"
         elif item.stage == "compare":
             mark, note = "≠", f"модель «{item.model_answer}», сайт «{item.site_answer}»"
+        elif item.stage == "review":
+            mark, note = "—", "отклонена при просмотре"
         else:
             mark, note = "✗", f"[{item.stage}] {item.message}"
         print(f"  {mark} {item.number:>8}  {note}")
@@ -404,6 +487,25 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Сколько задач держать в модели одновременно (по умолчанию 3)",
     )
     parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Показывать каждый разбор на правку перед публикацией "
+        "(правки формулируются репликами модели)",
+    )
+    parser.add_argument(
+        "--rewrite",
+        action="store_true",
+        help="Переписывать условие своими словами и проверять результат "
+        "независимым решением; включает --review",
+    )
+    parser.add_argument(
+        "--style-file",
+        type=Path,
+        default=None,
+        help="Образец оформления разбора: модель получит его сразу, "
+        "и первый же вариант выйдет в нужном стиле",
+    )
+    parser.add_argument(
         "--skip-upload",
         action="store_true",
         help="Только распарсить и решить, в админку не ходить",
@@ -442,12 +544,19 @@ async def run_pipeline(args: argparse.Namespace, numbers: list[str]) -> Pipeline
         )
     )
 
+    style_reference = ""
+    if args.style_file:
+        style_reference = args.style_file.read_text(encoding="utf-8")
+
     pipeline = Pipeline(
         scraper,
         processor,
         uploader,
         output_dir=args.output_dir,
         llm_concurrency=args.concurrency,
+        review=args.review or args.rewrite,
+        rewrite=args.rewrite,
+        style_reference=style_reference,
     )
 
     try:
@@ -469,6 +578,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     numbers = read_numbers(args)
     if not numbers:
         logger.error("Не задано ни одного номера задачи — нечего обрабатывать")
+        return 1
+
+    if (args.review or args.rewrite) and not sys.stdin.isatty():
+        logger.error(
+            "Режим правки требует интерактивного терминала — уберите --review/--rewrite"
+        )
+        return 1
+
+    if args.style_file and not args.style_file.exists():
+        logger.error("Файл образца %s не найден", args.style_file)
         return 1
 
     logger.info("К обработке %s задач(и): %s", len(numbers), ", ".join(numbers))

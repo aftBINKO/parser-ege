@@ -50,6 +50,62 @@ DEFAULT_STATE_PATH = Path(os.getenv("AUTH_STATE_PATH", "auth_state.json"))
 #: Признаки того, что нас выкинуло на страницу логина.
 LOGIN_URL_MARKERS = ("login", "signin", "sign-in", "auth")
 
+#: JS для ``--inspect``: собирает поля ввода вместе с готовыми селекторами.
+#: Подпись ищется по ``<label for>``, затем по родительскому ``<label>``, затем
+#: по ближайшему тексту выше — в админках встречаются все три варианта.
+_INSPECT_JS = """
+() => {
+  const cssEscape = (value) =>
+    window.CSS && CSS.escape ? CSS.escape(value) : value.replace(/([^\\w-])/g, '\\\\$1');
+
+  const labelFor = (el) => {
+    if (el.id) {
+      const byFor = document.querySelector(`label[for="${el.id}"]`);
+      if (byFor) return byFor.innerText.trim();
+    }
+    const parent = el.closest('label');
+    if (parent) return parent.innerText.trim();
+    const wrapper = el.closest('div, td, li, fieldset');
+    if (wrapper) {
+      const text = (wrapper.innerText || '').trim().split('\\n')[0];
+      if (text && text.length < 80) return text;
+    }
+    return '';
+  };
+
+  const selectorFor = (el, index) => {
+    if (el.id) return '#' + cssEscape(el.id);
+    if (el.name) return `${el.tagName.toLowerCase()}[name="${el.name}"]`;
+    const cls = (el.className || '').toString().trim().split(/\\s+/).filter(Boolean)[0];
+    if (cls) return `${el.tagName.toLowerCase()}.${cssEscape(cls)}`;
+    return `${el.tagName.toLowerCase()}:nth-of-type(${index + 1})`;
+  };
+
+  const nodes = document.querySelectorAll(
+    'input, textarea, select, [contenteditable="true"], button, [type="submit"]'
+  );
+
+  return Array.from(nodes).map((el, index) => {
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    const editable = el.getAttribute('contenteditable') === 'true';
+    const box = el.getBoundingClientRect();
+    return {
+      selector: selectorFor(el, index),
+      tag: tag,
+      type: type,
+      id: el.id || '',
+      name: el.getAttribute('name') || '',
+      placeholder: el.getAttribute('placeholder') || '',
+      label: labelFor(el),
+      text: tag === 'button' || type === 'submit' ? (el.innerText || el.value || '').trim() : '',
+      rich: editable,
+      visible: box.width > 0 && box.height > 0,
+    };
+  }).filter((item) => item.tag !== 'input' || !['hidden'].includes(item.type));
+}
+"""
+
 
 class UploaderError(Exception):
     """Базовая ошибка публикации."""
@@ -296,6 +352,46 @@ class AdminUploader:
 
         logger.debug("Поле '%s' заполнено (%s символов)", name, len(value))
 
+    def inspect_form(self) -> list[dict[str, Any]]:
+        """Перечислить поля формы на странице создания задачи.
+
+        Нужно, чтобы не подбирать селекторы в DevTools вручную: метод открывает
+        страницу под сохранённой сессией и возвращает все поля ввода — включая
+        те, что живут внутри iframe визуальных редакторов.
+
+        Для каждого поля возвращается готовый CSS-селектор (по ``id``, иначе по
+        ``name``, иначе по порядковому номеру), тип элемента, подпись и признак
+        ``rich`` — его нужно перечислить в ``rich_text_fields``.
+
+        :raises AuthStateError: сессия истекла.
+        :raises UploaderError: страница не открылась.
+        """
+        from playwright.sync_api import Error as PlaywrightError
+
+        self.open()
+        try:
+            self._page.goto(self.create_url, wait_until="domcontentloaded")
+            self._page.wait_for_load_state("networkidle")
+        except PlaywrightError as exc:
+            raise UploaderError(f"Не удалось открыть {self.create_url}: {exc}") from exc
+
+        self._check_authenticated()
+
+        fields: list[dict[str, Any]] = []
+        for frame in self._page.frames:
+            try:
+                found = frame.evaluate(_INSPECT_JS)
+            except PlaywrightError as exc:  # pragma: no cover - фрейм мог отвалиться
+                logger.debug("Фрейм %s не опрошен: %s", frame.url, exc)
+                continue
+
+            in_iframe = frame != self._page.main_frame
+            for item in found:
+                item["frame_url"] = frame.url if in_iframe else ""
+                item["in_iframe"] = in_iframe
+                fields.append(item)
+        return fields
+
     def _collect_form_error(self) -> str:
         """Прочитать сообщение об ошибке формы, если админка его показала."""
         selector = self.selectors.error_indicator
@@ -481,13 +577,59 @@ def load_solution(path: Path) -> TaskSolution:
     )
 
 
+def print_form_fields(fields: list[dict[str, Any]]) -> None:
+    """Напечатать найденные поля формы — чтобы скопировать селекторы в конфиг."""
+    if not fields:
+        print("Полей ввода на странице не найдено. Возможно, форма грузится позже "
+              "или лежит в iframe, недоступном для опроса.")
+        return
+
+    print(f"\nНайдено полей: {len(fields)}\n" + "=" * 78)
+    for item in fields:
+        kind = item["tag"]
+        if item["type"]:
+            kind += f"[{item['type']}]"
+        if item["rich"]:
+            kind += " (визуальный редактор)"
+        if item["in_iframe"]:
+            kind += " (внутри iframe)"
+
+        print(f"\n  селектор : {item['selector']}")
+        print(f"  тип      : {kind}")
+        for key, title in (
+            ("label", "подпись "),
+            ("placeholder", "плейсхолдер"),
+            ("name", "name    "),
+            ("text", "текст   "),
+        ):
+            if item.get(key):
+                print(f"  {title} : {item[key]}")
+        if not item["visible"]:
+            print("  ВНИМАНИЕ : элемент сейчас невидим — заполнение будет ждать его")
+
+    rich = [item["selector"] for item in fields if item["rich"] or item["in_iframe"]]
+    print("\n" + "=" * 78)
+    print("Перенесите нужные селекторы в FieldSelectors (uploader.py).")
+    if rich:
+        print(f"Поля {', '.join(rich)} — визуальные редакторы: перечислите их имена "
+              "в rich_text_fields, а для iframe заполните editor_frames.")
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Разобрать аргументы командной строки."""
     parser = argparse.ArgumentParser(
         description="Публикация готовой задачи в админку сайта."
     )
     parser.add_argument(
-        "solution", type=Path, help="JSON с решением (результат llm_processor)"
+        "solution",
+        type=Path,
+        nargs="?",
+        help="JSON с решением (результат llm_processor); не нужен при --inspect",
+    )
+    parser.add_argument(
+        "--inspect",
+        action="store_true",
+        help="Показать поля формы создания задачи и выйти (подбор селекторов)",
     )
     parser.add_argument(
         "--create-url",
@@ -525,8 +667,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = _parse_args(argv)
 
+    if not args.inspect and args.solution is None:
+        logger.error("Укажите JSON с решением или запустите с --inspect")
+        return 1
+
     try:
-        solution = load_solution(args.solution)
+        solution = None if args.inspect else load_solution(args.solution)
         uploader = AdminUploader(
             create_url=args.create_url,
             state_path=args.state,
@@ -540,6 +686,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     with uploader:
         try:
+            if args.inspect:
+                print_form_fields(uploader.inspect_form())
+                return 0
             result = uploader.publish(solution)
         except UploaderError as exc:
             logger.error("%s", exc)
