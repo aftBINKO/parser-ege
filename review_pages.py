@@ -278,9 +278,14 @@ def render_page(prototype: str, tasks: Sequence[UmTask], key: str) -> str:
 </body></html>"""
 
 
-def build_pages(tasks: Sequence[UmTask], out_dir: Path) -> list[Path]:
+def build_pages(
+    tasks: Sequence[UmTask], out_dir: Path, *, suffix: str = ""
+) -> list[Path]:
     """Собрать по странице на каждый прототип.
 
+    :param suffix: добавка к имени файла и ключу хранения отметок. Нужна, чтобы
+        просмотр своих задач и просмотр кандидатов на замену не перетирали
+        отметки друг друга.
     :returns: пути к созданным страницам.
     """
     out_dir = Path(out_dir)
@@ -293,13 +298,62 @@ def build_pages(tasks: Sequence[UmTask], out_dir: Path) -> list[Path]:
 
     created: list[Path] = []
     for (order, title), group in sorted(by_prototype.items()):
-        key = f"{order}-{group[0].prototype_code or 'proto'}"
-        page = render_page(f"{order}. {title}", group, key)
+        key = f"{order}-{group[0].prototype_code or 'proto'}{suffix}"
+        label = f"{order}. {title}"
+        if suffix == "-others":
+            label += " — кандидаты на замену"
+        page = render_page(label, group, key)
         path = out_dir / f"prototype-{key}.html"
         path.write_text(page, encoding="utf-8")
         created.append(path)
         logger.info("%s — %s задач → %s", title, len(group), path)
     return created
+
+
+def read_task_ids(path: Path) -> set[int]:
+    """Достать идентификаторы задач из выгрузки рабочей таблицы.
+
+    Понимает CSV и TSV: если есть колонка «Айди задания» (или ``id``), берутся
+    значения из неё, иначе — все целые числа подходящей длины из строки. Второй
+    путь нужен, потому что таблицу выгружают по-разному, а ошибиться колонкой
+    легко.
+
+    :raises ValueError: файл не читается или идентификаторов в нём нет.
+    """
+    try:
+        lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
+    except OSError as exc:
+        raise ValueError(f"Не удалось прочитать {path}: {exc}") from exc
+
+    if not lines:
+        raise ValueError(f"{path}: файл пуст")
+
+    separator = "\t" if lines[0].count("\t") >= lines[0].count(",") else ","
+    header = [cell.strip().strip('"').lower() for cell in lines[0].split(separator)]
+    column = next(
+        (
+            index
+            for index, name in enumerate(header)
+            if "айди" in name or name in {"id", "task_id"}
+        ),
+        None,
+    )
+
+    ids: set[int] = set()
+    for line in lines[1:] if column is not None else lines:
+        if column is not None:
+            cells = line.split(separator)
+            if column < len(cells):
+                value = cells[column].strip().strip('"')
+                if value.isdigit():
+                    ids.add(int(value))
+            continue
+        # Колонки не нашли — подбираем любые числа, похожие на идентификаторы.
+        ids.update(int(found) for found in re.findall(r"\b\d{5,9}\b", line))
+
+    if not ids:
+        raise ValueError(f"{path}: не нашёл идентификаторов задач")
+    return ids
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -308,6 +362,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description="Страницы просмотра базы: отметить неактуальные задачи."
     )
     parser.add_argument("database", type=Path, help="JSONL из umschool.py")
+    parser.add_argument(
+        "--table",
+        type=Path,
+        help="Выгрузка рабочей таблицы (CSV или TSV) — из неё берутся id задач",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("mine", "others", "all"),
+        default=None,
+        help="Что показывать: mine — только задачи из таблицы (по умолчанию, "
+        "если она задана), others — только остальную базу как кандидатов на "
+        "замену, all — всё подряд",
+    )
     parser.add_argument(
         "--out",
         type=Path,
@@ -334,7 +401,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("База пуста")
         return 1
 
-    pages = build_pages(tasks, args.out)
+    mode = args.mode or ("mine" if args.table else "all")
+    if mode != "all":
+        if not args.table:
+            logger.error("Режим «%s» требует --table с выгрузкой таблицы", mode)
+            return 1
+        try:
+            table_ids = read_task_ids(args.table)
+        except ValueError as exc:
+            logger.error("%s", exc)
+            return 1
+
+        total = len(tasks)
+        if mode == "mine":
+            tasks = [task for task in tasks if task.id in table_ids]
+            logger.info(
+                "Из таблицы: %s задач(и) из %s в базе; в таблице всего %s",
+                len(tasks), total, len(table_ids),
+            )
+            missing = len(table_ids) - len(tasks)
+            if missing > 0:
+                logger.warning(
+                    "%s задач(и) из таблицы нет в выкачанной базе — возможно, "
+                    "не хватает прототипов",
+                    missing,
+                )
+        else:
+            tasks = [task for task in tasks if task.id not in table_ids]
+            logger.info(
+                "Кандидаты на замену: %s задач(и) из %s (не входят в таблицу)",
+                len(tasks), total,
+            )
+
+    if not tasks:
+        logger.error("После фильтра не осталось задач")
+        return 1
+
+    pages = build_pages(tasks, args.out, suffix="" if mode == "all" else f"-{mode}")
     print(f"\nГотово: {len(pages)} страниц(ы) в {args.out}")
     for path in pages:
         print(f"  {path}")
