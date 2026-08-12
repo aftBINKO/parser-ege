@@ -28,6 +28,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,9 @@ DEFAULT_CREATE_URL = os.getenv("ADMIN_CREATE_TASK_URL", "")
 
 #: Файл с сохранённой сессией (создаётся auth_state.py).
 DEFAULT_STATE_PATH = Path(os.getenv("AUTH_STATE_PATH", "auth_state.json"))
+
+#: Сколько вариантов выпадающего списка показывать в --inspect.
+MAX_SHOWN_OPTIONS = 12
 
 #: Признаки того, что нас выкинуло на страницу логина.
 LOGIN_URL_MARKERS = ("login", "signin", "sign-in", "auth")
@@ -112,6 +116,12 @@ _INSPECT_JS = """
       rich: editable,
       visible: box.width > 0 && box.height > 0,
       chrome: isEditorChrome(el),
+      // Для выпадающих списков перечисляем варианты: именно их значения нужно
+      // прописать в selects, а угадать их по названию поля невозможно.
+      options: tag === 'select'
+        ? Array.from(el.options).map((o) => ({ value: o.value, label: o.text.trim() }))
+        : [],
+      value: tag === 'select' ? el.value : '',
     };
   }).filter((item) => item.tag !== 'input' || !['hidden'].includes(item.type));
 }
@@ -383,17 +393,21 @@ class AdminUploader:
 
         logger.debug("Поле '%s' заполнено (%s символов)", name, len(value))
 
-    def inspect_form(self) -> list[dict[str, Any]]:
+    def inspect_form(self, *, wait_for_user: bool = False) -> list[dict[str, Any]]:
         """Перечислить поля формы на странице создания задачи.
 
         Нужно, чтобы не подбирать селекторы в DevTools вручную: метод открывает
         страницу под сохранённой сессией и возвращает все поля ввода — включая
-        те, что живут внутри iframe визуальных редакторов.
+        те, что живут внутри iframe визуальных редакторов, и варианты
+        выпадающих списков.
 
-        Для каждого поля возвращается готовый CSS-селектор (по ``id``, иначе по
-        ``name``, иначе по порядковому номеру), тип элемента, подпись и признак
-        ``rich`` — его нужно перечислить в ``rich_text_fields``.
+        Часть полей формы появляется только после выбора значений в списках
+        (например, поле ответа — после выбора типа структуры). Поэтому перед
+        осмотром выставляются списки из :attr:`FieldSelectors.selects`, а с
+        ``wait_for_user`` можно донастроить форму руками в открытом окне.
 
+        :param wait_for_user: дождаться Enter в терминале, дав настроить форму
+            в браузере. Осмысленно только вместе с ``headless=False``.
         :raises AuthStateError: сессия истекла.
         :raises UploaderError: страница не открылась.
         """
@@ -407,6 +421,24 @@ class AdminUploader:
             raise UploaderError(f"Не удалось открыть {self.create_url}: {exc}") from exc
 
         self._check_authenticated()
+
+        # Списки могут достраивать форму, поэтому выставляем их до осмотра.
+        for selector, value in self.selectors.selects.items():
+            try:
+                self._fill_select(selector, value)
+            except UploaderError as exc:
+                logger.warning("%s", exc)
+
+        if wait_for_user:
+            if not sys.stdin.isatty():
+                logger.warning("Нет интерактивного терминала — осматриваю как есть")
+            else:
+                print(
+                    "\n>>> Настройте форму в открытом окне браузера так, чтобы "
+                    "появились нужные поля.\n>>> Затем вернитесь сюда и нажмите Enter."
+                )
+                input(">>> Enter для осмотра формы... ")
+            self._page.wait_for_timeout(300)
 
         fields: list[dict[str, Any]] = []
         for frame in self._page.frames:
@@ -658,6 +690,45 @@ def load_solution(path: Path) -> TaskSolution:
     )
 
 
+def split_select_pair(pair: str) -> tuple[str, str]:
+    """Разделить строку ``селектор=значение``.
+
+    Делить по первому «=» нельзя: сам селектор его содержит —
+    ``select[name="structure_type"]``. Поэтому ищем знак равенства вне скобок и
+    вне кавычек: там он может быть только разделителем.
+
+    :raises UploaderError: разделитель не найден.
+    """
+    depth = 0
+    quote = ""
+
+    for index, char in enumerate(pair):
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char in "[(":
+            depth += 1
+        elif char in "])":
+            depth -= 1
+        elif char == "=" and depth <= 0:
+            selector, value = pair[:index].strip(), pair[index + 1 :].strip()
+            if selector:
+                return selector, value
+            break
+
+    raise UploaderError(f"Ожидался формат СЕЛЕКТОР=ЗНАЧЕНИЕ, получено: {pair!r}")
+
+
+def parse_selects(pairs: Sequence[str]) -> dict[str, str]:
+    """Разобрать аргументы вида ``селектор=значение`` в словарь.
+
+    :raises UploaderError: аргумент записан без «=».
+    """
+    return dict(split_select_pair(pair) for pair in pairs)
+
+
 def print_form_fields(fields: list[dict[str, Any]], *, show_all: bool = False) -> None:
     """Напечатать найденные поля формы — чтобы скопировать селекторы в конфиг.
 
@@ -699,6 +770,19 @@ def print_form_fields(fields: list[dict[str, Any]], *, show_all: bool = False) -
         ):
             if item.get(key):
                 print(f"  {title} : {item[key]}")
+
+        options = item.get("options") or []
+        if options:
+            current = item.get("value") or ""
+            shown = options[:MAX_SHOWN_OPTIONS]
+            labels = ", ".join(
+                f"«{option['label']}»" + (" ←" if option["value"] == current else "")
+                for option in shown
+                if option["label"]
+            )
+            tail = "" if len(options) <= MAX_SHOWN_OPTIONS else f" … ещё {len(options) - MAX_SHOWN_OPTIONS}"
+            print(f"  варианты : {labels}{tail}")
+
         if not item["visible"]:
             print("  ВНИМАНИЕ : элемент сейчас невидим — заполнение будет ждать его")
 
@@ -708,6 +792,27 @@ def print_form_fields(fields: list[dict[str, Any]], *, show_all: bool = False) -
     if rich:
         print(f"Поля {', '.join(rich)} — визуальные редакторы: перечислите их имена "
               "в rich_text_fields, а для iframe заполните editor_frames.")
+
+    selects = [item for item in fields if item.get("options")]
+    if selects:
+        print(
+            "\nЕсли нужные поля не появились — их достраивают выпадающие списки. "
+            "Выставьте их и осмотрите форму заново, например:"
+        )
+        example = selects[0]
+        # Первый вариант обычно пустая заглушка («— не выбрано —») — берём
+        # первый содержательный, иначе пример получится бессмысленным.
+        label = next(
+            (
+                option["label"]
+                for option in example["options"]
+                if option["label"] and option["value"]
+            ),
+            "",
+        )
+        print(f'  python uploader.py --inspect --select \'{example["selector"]}={label}\'')
+        print("Или настройте форму руками в браузере:")
+        print("  python uploader.py --inspect --headed --wait")
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -730,6 +835,20 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--all",
         action="store_true",
         help="При --inspect показывать и кнопки панелей визуальных редакторов",
+    )
+    parser.add_argument(
+        "--select",
+        action="append",
+        default=[],
+        metavar="СЕЛЕКТОР=ЗНАЧЕНИЕ",
+        help="Выставить выпадающий список перед осмотром или публикацией; "
+        "можно указывать несколько раз",
+    )
+    parser.add_argument(
+        "--wait",
+        action="store_true",
+        help="При --inspect дождаться Enter, дав настроить форму в браузере "
+        "(вместе с --headed)",
     )
     parser.add_argument(
         "--create-url",
@@ -772,10 +891,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     try:
+        selects = parse_selects(args.select)
         solution = None if args.inspect else load_solution(args.solution)
         uploader = AdminUploader(
             create_url=args.create_url,
             state_path=args.state,
+            selectors=FieldSelectors(selects=selects),
             headless=not args.headed,
             dry_run=args.dry_run,
             screenshot_dir=args.screenshot_dir,
@@ -787,7 +908,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     with uploader:
         try:
             if args.inspect:
-                print_form_fields(uploader.inspect_form(), show_all=args.all)
+                print_form_fields(
+                    uploader.inspect_form(wait_for_user=args.wait), show_all=args.all
+                )
                 return 0
             result = uploader.publish(solution)
         except UploaderError as exc:
