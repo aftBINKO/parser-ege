@@ -195,11 +195,16 @@ class FieldSelectors:
     :param solution: поле с текстом решения, второй редактор.
     :param extra_text: поле «Доп. текст», третий редактор. Заполняется только
         если задано; сейчас пусто.
-    :param answer: поле ответа. В осмотре формы поля с такой подписью нет —
-        похоже, ответ добавляется безымянным ``input.custom_input`` рядом с
-        кнопкой. Определите его через ``--detect`` и подставьте сюда.
+    :param answer: поле ответа. Оно живёт **на следующем экране**, который
+        открывается после сохранения задания, поэтому осмотром страницы
+        создания его не найти. Осмотрите второй экран: дойдите до него руками
+        при ``--inspect --headed --wait`` и нажмите Enter.
     :param hints: поле подсказок (все подсказки склеиваются в одну строку).
-        Тоже не найдено осмотром — определите через ``--detect``.
+        Тоже на втором экране, если оно там есть.
+    :param answer_step_indicator: элемент, по которому видно, что второй экран
+        открылся. Если пусто, ожидание идёт по самому полю ответа.
+    :param answer_save_button: кнопка сохранения на втором экране. Если пусто,
+        используется :attr:`save_button`.
     :param save_button: кнопка сохранения.
     :param success_indicator: элемент, появляющийся после успешного сохранения.
         Если пусто — успех определяется по отсутствию ошибок и тому, что
@@ -222,6 +227,8 @@ class FieldSelectors:
     extra_text: str = ""
     answer: str = ""
     hints: str = ""
+    answer_step_indicator: str = ""
+    answer_save_button: str = ""
     save_button: str = 'button:has-text("Сохранить")'
     success_indicator: str = ""
     error_indicator: str = ".errorlist, .alert-danger, .invalid-feedback"
@@ -617,48 +624,101 @@ class AdminUploader:
             ("task_id", solution.task_id),
             ("condition", condition),
             ("solution", solution_text),
-            ("answer", solution.answer),
-            ("hints", hints),
         ):
             self._fill_field(name, getattr(self.selectors, name), value)
 
-    def _submit(self, task_id: str) -> UploadResult:
-        """Нажать сохранение и дождаться подтверждения.
+    def has_answer_step(self) -> bool:
+        """Есть ли второй экран с ответом.
 
-        :returns: результат публикации; исключение наружу не выпускается — при
+        В админке umschool ответ вводится не вместе с заданием, а на следующем
+        экране — после подтверждения. Второй шаг включается тем, что для него
+        задан хотя бы один селектор.
+        """
+        return bool(self.selectors.answer or self.selectors.hints)
+
+    def _fill_answer_step(self, solution: TaskSolution) -> None:
+        """Заполнить поля второго экрана: ответ и подсказки.
+
+        :raises UploaderError: поля не появились за отведённое время.
+        """
+        if self.render:
+            hints = render_hints(solution.hints, separator=self.hints_separator)
+        else:
+            hints = self.hints_separator.join(solution.hints)
+
+        for name, value in (("answer", solution.answer), ("hints", hints)):
+            self._fill_field(name, getattr(self.selectors, name), value)
+
+    def _wait_answer_step(self, task_id: str) -> UploadResult | None:
+        """Дождаться появления второго экрана.
+
+        :returns: ``None``, если экран открылся, иначе результат с ошибкой.
+        """
+        from playwright.sync_api import Error as PlaywrightError
+
+        marker = self.selectors.answer_step_indicator or self.selectors.answer
+        if not marker:
+            return None
+
+        try:
+            self._page.wait_for_selector(marker, timeout=self.timeout_ms)
+        except PlaywrightError as exc:
+            return UploadResult(
+                task_id,
+                False,
+                f"Задание сохранено, но экран ответа не открылся "
+                f"('{marker}'): {exc}",
+                self._screenshot(task_id),
+            )
+        return None
+
+    def _submit(
+        self,
+        task_id: str,
+        *,
+        button_selector: str,
+        success_indicator: str,
+        step: str = "публикация",
+    ) -> UploadResult:
+        """Нажать кнопку сохранения и дождаться подтверждения.
+
+        :param button_selector: какую кнопку нажимать.
+        :param success_indicator: что ждать после нажатия. Пусто — довольствуемся
+            тем, что страница устоялась.
+        :param step: название шага для сообщения об ошибке.
+        :returns: результат шага; исключение наружу не выпускается — при
             пакетной заливке одна плохая задача не должна ронять весь прогон.
         """
         from playwright.sync_api import Error as PlaywrightError
 
-        selectors = self.selectors
         try:
-            button = self._page.locator(selectors.save_button).first
+            button = self._page.locator(button_selector).first
             button.wait_for(state="visible", timeout=self.timeout_ms)
             button.click()
         except PlaywrightError as exc:
             return UploadResult(
-                task_id, False, f"Не удалось нажать сохранение: {exc}",
+                task_id, False, f"{step}: не удалось нажать сохранение: {exc}",
                 self._screenshot(task_id),
             )
 
         error = self._collect_form_error()
         if error:
             return UploadResult(
-                task_id, False, f"Админка вернула ошибку: {error}",
+                task_id, False, f"{step}: админка вернула ошибку: {error}",
                 self._screenshot(task_id),
             )
 
-        if selectors.success_indicator:
+        if success_indicator:
             try:
                 self._page.wait_for_selector(
-                    selectors.success_indicator, timeout=self.timeout_ms
+                    success_indicator, timeout=self.timeout_ms
                 )
             except PlaywrightError as exc:
                 return UploadResult(
                     task_id,
                     False,
-                    f"Не дождался подтверждения сохранения "
-                    f"('{selectors.success_indicator}'): {exc}",
+                    f"{step}: не дождался подтверждения "
+                    f"('{success_indicator}'): {exc}",
                     self._screenshot(task_id),
                 )
         else:
@@ -669,6 +729,13 @@ class AdminUploader:
 
     def publish(self, solution: TaskSolution) -> UploadResult:
         """Опубликовать одну задачу.
+
+        Публикация двухшаговая: сначала сохраняется само задание, затем на
+        следующем экране вводится ответ. Второй шаг выполняется, только если для
+        него заданы селекторы (см. :meth:`has_answer_step`).
+
+        Холостой прогон останавливается перед первым сохранением, поэтому второй
+        экран в нём не проверяется — до него просто не доходит дело.
 
         :raises AuthStateError: сессия истекла — дальнейшие попытки бессмысленны.
         """
@@ -697,10 +764,61 @@ class AdminUploader:
             logger.info("Холостой прогон: форма заполнена, сохранение не нажимаю")
             return UploadResult(task_id, True, "dry-run: форма заполнена")
 
-        result = self._submit(task_id)
+        answer_step = self.has_answer_step()
+        result = self._submit(
+            task_id,
+            button_selector=self.selectors.save_button,
+            # Признаком удачи первого шага служит появление второго экрана,
+            # если он есть: собственного индикатора у шага может не быть.
+            success_indicator=(
+                self.selectors.answer_step_indicator
+                if answer_step
+                else self.selectors.success_indicator
+            ),
+            step="задание",
+        )
+
+        if result.ok and answer_step:
+            result = self._publish_answer_step(solution, task_id)
+
         logger.info(
             "Задача %s: %s", task_id, "успех" if result.ok else f"ошибка — {result.message}"
         )
+        return result
+
+    def _publish_answer_step(
+        self, solution: TaskSolution, task_id: str
+    ) -> UploadResult:
+        """Провести второй шаг публикации: экран с ответом.
+
+        Задание на этот момент уже сохранено, поэтому неудача здесь означает не
+        «ничего не произошло», а «задание есть, ответа нет» — это и сообщается,
+        чтобы вы понимали, что именно доделать руками.
+        """
+        failure = self._wait_answer_step(task_id)
+        if failure is not None:
+            return failure
+
+        try:
+            self._fill_answer_step(solution)
+        except UploaderError as exc:
+            return UploadResult(
+                task_id,
+                False,
+                f"Задание сохранено, но ответ не заполнен: {exc}",
+                self._screenshot(task_id),
+            )
+
+        result = self._submit(
+            task_id,
+            button_selector=(
+                self.selectors.answer_save_button or self.selectors.save_button
+            ),
+            success_indicator=self.selectors.success_indicator,
+            step="ответ",
+        )
+        if not result.ok:
+            result.message = f"Задание сохранено. {result.message}"
         return result
 
     def publish_many(self, solutions: Iterable[TaskSolution]) -> list[UploadResult]:
