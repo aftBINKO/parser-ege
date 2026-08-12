@@ -91,21 +91,24 @@ class ScraperError(Exception):
 class ApiFieldConfig:
     """Имена полей в ответе API.
 
-    Схема API заранее не известна, поэтому для каждого поля перечислены
-    вероятные имена: берётся первое совпадение при обходе JSON в ширину (то
-    есть самое «внешнее»). Когда посмотрите реальный ответ через ``--dump-json``,
-    сведите каждый кортеж к единственному точному имени — так надёжнее.
+    Первым в каждом кортеже стоит имя из реальной схемы ``/api/v1/task/<номер>``,
+    дальше — запасные варианты на случай изменения API. Порядок значим: имя
+    перебирается слева направо, поэтому точное всегда выигрывает у запасного.
+
+    Отдельно стоит отметить два поля, где интуиция подводит:
+
+    * номер задачи — это ``taskId`` (21401), тогда как ``id`` содержит
+      внутренний UUID, а ``number`` — номер задания в ЕГЭ (1–27);
+    * ответ лежит в ``key``, а не в ``answer``.
 
     Все имена сравниваются в нижнем регистре.
     """
 
-    condition: tuple[str, ...] = (
-        "text", "condition", "statement", "task", "body", "question", "content", "html"
-    )
-    answer: tuple[str, ...] = ("answer", "correct_answer", "right_answer", "result")
-    task_id: tuple[str, ...] = ("id", "number", "task_id", "num")
-    images: tuple[str, ...] = ("images", "pictures", "files", "attachments", "media")
-    solution: tuple[str, ...] = ("solution", "explanation", "analysis")
+    condition: tuple[str, ...] = ("text", "condition", "statement", "body", "html")
+    answer: tuple[str, ...] = ("key", "answer", "correct_answer", "right_answer")
+    task_id: tuple[str, ...] = ("taskid", "task_id", "id")
+    images: tuple[str, ...] = ("files", "images", "pictures", "attachments", "media")
+    solution: tuple[str, ...] = ("solve_text", "solution", "explanation")
 
 
 @dataclass(slots=True)
@@ -276,18 +279,21 @@ def _walk(payload: Any) -> Iterable[dict[str, Any]]:
 def find_field(payload: Any, names: tuple[str, ...]) -> str:
     """Найти в JSON первое непустое скалярное значение по одному из имён.
 
-    Обход идёт в ширину, поэтому поле верхнего уровня выигрывает у одноимённого
-    вложенного.
+    Имена перебираются в порядке кортежа: точное имя из реальной схемы должно
+    выигрывать у запасного, даже если запасное встречается в JSON раньше. Внутри
+    одного имени обход идёт в ширину, поэтому поле верхнего уровня выигрывает у
+    одноимённого вложенного.
 
     :returns: значение строкой либо пустая строка, если ничего не нашлось.
     """
-    wanted = {name.lower() for name in names}
-    for node in _walk(payload):
-        for key, value in node.items():
-            if key.lower() in wanted and isinstance(value, (str, int, float)):
-                text = str(value).strip()
-                if text:
-                    return text
+    for name in names:
+        wanted = name.lower()
+        for node in _walk(payload):
+            for key, value in node.items():
+                if key.lower() == wanted and isinstance(value, (str, int, float)):
+                    text = str(value).strip()
+                    if text:
+                        return text
     return ""
 
 
