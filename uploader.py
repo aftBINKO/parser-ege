@@ -65,6 +65,9 @@ _INSPECT_JS = """
     }
     const parent = el.closest('label');
     if (parent) return parent.innerText.trim();
+    // Внутри обёртки визуального редактора «ближайшим текстом» окажутся
+    // подписи кнопок панели — подписью поля они не являются.
+    if (el.closest('.fr-box, .tox-tinymce, .cke, .ql-container')) return '';
     const wrapper = el.closest('div, td, li, fieldset');
     if (wrapper) {
       const text = (wrapper.innerText || '').trim().split('\\n')[0];
@@ -85,6 +88,12 @@ _INSPECT_JS = """
     'input, textarea, select, [contenteditable="true"], button, [type="submit"]'
   );
 
+  // Панели визуальных редакторов (Froala, TinyMCE, CKEditor) дают сотни кнопок
+  // «Bold», «Italic» и подобных. К форме они отношения не имеют и только
+  // топят полезные поля — помечаем их, чтобы отфильтровать при выводе.
+  const isEditorChrome = (el) =>
+    Boolean(el.closest('.fr-toolbar, .fr-popup, .tox-toolbar, .tox-tbtn, .cke_toolbox, .ql-toolbar'));
+
   return Array.from(nodes).map((el, index) => {
     const tag = el.tagName.toLowerCase();
     const type = (el.getAttribute('type') || '').toLowerCase();
@@ -101,6 +110,7 @@ _INSPECT_JS = """
       text: tag === 'button' || type === 'submit' ? (el.innerText || el.value || '').trim() : '',
       rich: editable,
       visible: box.width > 0 && box.height > 0,
+      chrome: isEditorChrome(el),
     };
   }).filter((item) => item.tag !== 'input' || !['hidden'].includes(item.type));
 }
@@ -124,38 +134,54 @@ class AuthStateError(UploaderError):
 class FieldSelectors:
     """CSS-селекторы полей формы создания задачи.
 
-    ЗНАЧЕНИЯ НИЖЕ — ПЛЕЙСХОЛДЕРЫ, замените на реальные.
+    Значения подставлены по выводу ``--inspect`` на реальной админке и требуют
+    проверки холостым прогоном. Пустая строка означает «этого поля в форме нет»
+    — шаг просто пропускается.
 
-    Пустая строка означает «этого поля в форме нет» — шаг просто пропускается.
+    Три замечания по этой конкретной админке:
 
-    :param task_id: поле с номером задачи.
-    :param condition: поле условия.
+    * условие, решение и доп. текст — редакторы Froala. Они не ``textarea``, а
+      ``div.fr-element``, и на странице их три подряд, поэтому различаются по
+      порядковому номеру (``>> nth=``). Порядок соответствует подписям
+      «Вопрос», «Решение», «Доп. текст»;
+    * ``#title`` — это «Максимальный балл», а условие лежит в
+      ``textarea[name="title"]``. Ловушка: по имени легко перепутать;
+    * кнопок ``button.button`` две («Сохранить» и «Пересчитать баллы»), поэтому
+      сохранение ищется по тексту.
+
+    :param task_id: поле с номером задачи. В этой админке отдельного поля под
+        номер задачи с kompege нет — оставлено пустым.
+    :param condition: поле условия («Вопрос»).
     :param solution: поле с текстом решения.
     :param answer: поле ответа.
     :param hints: поле подсказок (все подсказки склеиваются в одну строку).
     :param save_button: кнопка сохранения.
-    :param success_indicator: элемент, появляющийся после успешного сохранения
-        (тост «Сохранено», строка в списке задач). Если пусто — успех
-        определяется по отсутствию ошибок и смене URL.
+    :param success_indicator: элемент, появляющийся после успешного сохранения.
+        Если пусто — успех определяется по отсутствию ошибок и тому, что
+        страница устоялась.
     :param error_indicator: элемент с сообщением об ошибке формы.
-    :param rich_text_fields: имена полей (из этого же класса), которые в админке
-        являются визуальными редакторами, а не ``input``/``textarea``. Для них
-        вместо ``fill()`` используется ввод в ``contenteditable``.
+    :param rich_text_fields: поля-редакторы: вместо ``fill()`` в них печатают
+        как в ``contenteditable``. Для Froala это обязательно — иначе редактор
+        не заметит вставку и не перенесёт её в скрытую ``textarea`` при
+        сохранении.
     :param editor_frames: поля, чей редактор живёт внутри iframe (TinyMCE и
-        подобные), в виде ``{"condition": "iframe#condition_ifr"}``. Значение —
-        селектор самого iframe.
+        подобные): ``{"condition": "iframe#condition_ifr"}``.
+    :param selects: выпадающие списки, которые нужно выставить перед
+        сохранением: ``{селектор: значение}``. Значение ищется по видимому
+        тексту пункта, а если такого нет — по его ``value``.
     """
 
-    task_id: str = "#task-id-input"
-    condition: str = "#condition-input"
-    solution: str = "#solution-input"
-    answer: str = "#answer-input"
-    hints: str = "#hints-input"
-    save_button: str = "#save-button"
-    success_indicator: str = ".toast-success"
-    error_indicator: str = ".form-error"
-    rich_text_fields: tuple[str, ...] = ()
+    task_id: str = ""
+    condition: str = "div.fr-element >> nth=0"
+    solution: str = "div.fr-element >> nth=1"
+    answer: str = ""
+    hints: str = ""
+    save_button: str = 'button:has-text("Сохранить")'
+    success_indicator: str = ""
+    error_indicator: str = ".errorlist, .alert-danger, .invalid-feedback"
+    rich_text_fields: tuple[str, ...] = ("condition", "solution")
     editor_frames: dict[str, str] = field(default_factory=dict)
+    selects: dict[str, str] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -392,6 +418,33 @@ class AdminUploader:
                 fields.append(item)
         return fields
 
+    def _fill_select(self, selector: str, value: str) -> None:
+        """Выставить значение выпадающего списка.
+
+        Сначала пробуем найти пункт по видимому тексту («Информатика»), затем по
+        его ``value`` — в разметке админок встречается и то, и другое.
+
+        :raises UploaderError: списка нет или в нём нет такого пункта.
+        """
+        from playwright.sync_api import Error as PlaywrightError
+
+        locator = self._page.locator(selector).first
+        try:
+            locator.wait_for(state="visible", timeout=self.timeout_ms)
+        except PlaywrightError as exc:
+            raise UploaderError(f"Список {selector} не появился: {exc}") from exc
+
+        try:
+            locator.select_option(label=value)
+        except PlaywrightError:
+            try:
+                locator.select_option(value=value)
+            except PlaywrightError as exc:
+                raise UploaderError(
+                    f"В списке {selector} нет варианта «{value}»: {exc}"
+                ) from exc
+        logger.debug("Список %s = %s", selector, value)
+
     def _collect_form_error(self) -> str:
         """Прочитать сообщение об ошибке формы, если админка его показала."""
         selector = self.selectors.error_indicator
@@ -422,7 +475,15 @@ class AdminUploader:
     # -- публикация ---------------------------------------------------------- #
 
     def _fill_form(self, solution: TaskSolution) -> None:
-        """Разложить данные решения по полям формы."""
+        """Разложить данные решения по полям формы.
+
+        Выпадающие списки выставляются первыми: от них в админках обычно зависит
+        состав остальной формы (например, поле ответа появляется только после
+        выбора типа структуры).
+        """
+        for selector, value in self.selectors.selects.items():
+            self._fill_select(selector, value)
+
         hints = self.hints_separator.join(solution.hints)
         for name, value in (
             ("task_id", solution.task_id),
@@ -577,14 +638,28 @@ def load_solution(path: Path) -> TaskSolution:
     )
 
 
-def print_form_fields(fields: list[dict[str, Any]]) -> None:
-    """Напечатать найденные поля формы — чтобы скопировать селекторы в конфиг."""
+def print_form_fields(fields: list[dict[str, Any]], *, show_all: bool = False) -> None:
+    """Напечатать найденные поля формы — чтобы скопировать селекторы в конфиг.
+
+    :param show_all: показывать и кнопки панелей визуальных редакторов. По
+        умолчанию они скрыты: одна панель Froala добавляет полсотни кнопок
+        «Bold», «Italic» и прочих, среди которых полезные поля теряются.
+    """
+    hidden = 0
+    if not show_all:
+        total = len(fields)
+        fields = [item for item in fields if not item.get("chrome")]
+        hidden = total - len(fields)
+
     if not fields:
         print("Полей ввода на странице не найдено. Возможно, форма грузится позже "
               "или лежит в iframe, недоступном для опроса.")
         return
 
-    print(f"\nНайдено полей: {len(fields)}\n" + "=" * 78)
+    print(f"\nНайдено полей: {len(fields)}")
+    if hidden:
+        print(f"(скрыто кнопок панелей редакторов: {hidden}; показать — с --all)")
+    print("=" * 78)
     for item in fields:
         kind = item["tag"]
         if item["type"]:
@@ -630,6 +705,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--inspect",
         action="store_true",
         help="Показать поля формы создания задачи и выйти (подбор селекторов)",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="При --inspect показывать и кнопки панелей визуальных редакторов",
     )
     parser.add_argument(
         "--create-url",
@@ -687,7 +767,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     with uploader:
         try:
             if args.inspect:
-                print_form_fields(uploader.inspect_form())
+                print_form_fields(uploader.inspect_form(), show_all=args.all)
                 return 0
             result = uploader.publish(solution)
         except UploaderError as exc:

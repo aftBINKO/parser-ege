@@ -44,6 +44,7 @@ from typing import Any, Iterable, Sequence
 
 from dotenv import load_dotenv
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 load_dotenv()
@@ -57,6 +58,18 @@ logger = logging.getLogger(__name__)
 #: Модель по умолчанию; переопределяется переменной окружения ``GEMINI_MODEL``.
 #: Для разборов ЕГЭ важнее рассуждения, чем скорость, поэтому pro.
 DEFAULT_MODEL = "gemini-2.5-pro"
+
+#: Запасная модель на случай, если основная перегружена (задаётся
+#: ``GEMINI_FALLBACK_MODEL``). Пусто — запасной нет, задача просто падает.
+DEFAULT_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "")
+
+#: HTTP-коды, при которых повтор осмыслен: перегрузка, лимиты, сбои сервера.
+#: Всё остальное (неверный ключ, недоступная модель, слишком длинный запрос)
+#: повторять бессмысленно — ошибка не рассосётся, а время потратится.
+RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+#: Потолок задержки между попытками, сек: при 503 ждать дольше смысла мало.
+MAX_RETRY_DELAY = 60.0
 
 #: Поля, которые обязаны присутствовать в ответе модели.
 REQUIRED_FIELDS: tuple[str, ...] = (
@@ -184,6 +197,22 @@ class LLMError(Exception):
 
 class LLMRequestError(LLMError):
     """Не удалось получить ответ от API (сеть, лимиты, блокировка контента)."""
+
+
+def is_retryable(exc: BaseException) -> bool:
+    """Стоит ли повторять запрос после этой ошибки.
+
+    Ошибки API несут HTTP-код: 429 и 5xx означают «попробуй позже» (перегрузка
+    модели, лимиты, сбой сервера), а 4xx — что запрос не так составлен и
+    повторять его бесполезно. Ошибки без кода (обрыв сети, таймаут) считаем
+    временными.
+    """
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code in RETRYABLE_STATUS
+    if isinstance(exc, genai_errors.ClientError):
+        return False
+    return True
 
 
 class LLMResponseError(LLMError):
@@ -350,11 +379,13 @@ class GeminiProcessor:
 
     :param api_key: ключ API. По умолчанию берётся из ``GEMINI_API_KEY``.
     :param model_name: имя модели. По умолчанию — из ``GEMINI_MODEL``.
+    :param fallback_model: запасная модель на случай перегрузки основной.
+        По умолчанию — из ``GEMINI_FALLBACK_MODEL``; пусто — запасной нет.
     :param system_instruction: системный промпт; по умолчанию
         :data:`SYSTEM_INSTRUCTION`.
     :param temperature: температура генерации. Для разборов задач нужен
         предсказуемый результат, поэтому значение по умолчанию низкое.
-    :param max_retries: сколько раз повторить запрос при сбое.
+    :param max_retries: сколько раз повторить запрос при временной ошибке.
     :param retry_base_delay: базовая задержка экспоненциального бэкоффа, сек.
     """
 
@@ -363,10 +394,11 @@ class GeminiProcessor:
         api_key: str | None = None,
         *,
         model_name: str | None = None,
+        fallback_model: str | None = None,
         system_instruction: str = SYSTEM_INSTRUCTION,
         temperature: float = 0.2,
-        max_retries: int = 3,
-        retry_base_delay: float = 2.0,
+        max_retries: int = 5,
+        retry_base_delay: float = 4.0,
     ) -> None:
         key = api_key or os.getenv("GEMINI_API_KEY")
         if not key:
@@ -375,6 +407,9 @@ class GeminiProcessor:
             )
 
         self.model_name = model_name or os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
+        self.fallback_model = (
+            DEFAULT_FALLBACK_MODEL if fallback_model is None else fallback_model
+        )
         self.max_retries = max(1, max_retries)
         self.retry_base_delay = retry_base_delay
 
@@ -424,22 +459,30 @@ class GeminiProcessor:
                     parts.append(part_text)
         return "".join(parts)
 
-    async def _generate(self, prompt: str) -> str:
-        """Выполнить запрос к API с экспоненциальным бэкоффом.
+    async def _generate_with(self, model: str, prompt: str) -> str:
+        """Обратиться к конкретной модели, повторяя попытки при перегрузке.
 
-        :raises LLMRequestError: если все попытки исчерпаны.
+        Повторы делаются только по временным ошибкам (429, 5xx, обрыв связи);
+        на ошибке запроса (неверный ключ, нет такой модели) выходим сразу.
+
+        :raises LLMRequestError: попытки исчерпаны или ошибка неповторяемая.
         """
         last_error: Exception | None = None
 
         for attempt in range(1, self.max_retries + 1):
             try:
                 response = await self._client.aio.models.generate_content(
-                    model=self.model_name, contents=prompt, config=self._config
+                    model=model, contents=prompt, config=self._config
                 )
             except Exception as exc:  # SDK бросает разнородные исключения
                 last_error = exc
+                if not is_retryable(exc):
+                    raise LLMRequestError(
+                        f"Запрос к модели {model} отклонён: {exc}"
+                    ) from exc
                 logger.warning(
-                    "Запрос к Gemini не удался (попытка %s/%s): %s",
+                    "Модель %s не ответила (попытка %s/%s): %s",
+                    model,
                     attempt,
                     self.max_retries,
                     exc,
@@ -450,17 +493,46 @@ class GeminiProcessor:
                     return text
                 last_error = LLMRequestError("Модель вернула пустой ответ")
                 logger.warning(
-                    "Пустой ответ Gemini (попытка %s/%s)", attempt, self.max_retries
+                    "Пустой ответ модели %s (попытка %s/%s)",
+                    model,
+                    attempt,
+                    self.max_retries,
                 )
 
             if attempt < self.max_retries:
                 # jitter, чтобы параллельные запросы не били по лимитам синхронно
-                delay = self.retry_base_delay * 2 ** (attempt - 1)
-                await asyncio.sleep(delay + random.uniform(0, 0.5))
+                delay = min(
+                    self.retry_base_delay * 2 ** (attempt - 1), MAX_RETRY_DELAY
+                )
+                delay += random.uniform(0, 0.5)
+                logger.info("Жду %.1f с перед следующей попыткой", delay)
+                await asyncio.sleep(delay)
 
         raise LLMRequestError(
-            f"Не удалось получить ответ от Gemini за {self.max_retries} попыт(ок): {last_error}"
+            f"Модель {model} не ответила за {self.max_retries} попыт(ок): {last_error}"
         ) from last_error
+
+    async def _generate(self, prompt: str) -> str:
+        """Получить ответ модели, при необходимости переключившись на запасную.
+
+        Перегрузка конкретной модели (503 «high demand») — самая частая причина
+        сбоя, и ждать её бывает дольше, чем спросить другую. Если задана
+        запасная модель, после исчерпания попыток запрос уходит ей.
+
+        :raises LLMRequestError: не ответила ни основная модель, ни запасная.
+        """
+        try:
+            return await self._generate_with(self.model_name, prompt)
+        except LLMRequestError:
+            if not self.fallback_model or self.fallback_model == self.model_name:
+                raise
+            logger.warning(
+                "Основная модель %s недоступна — пробую запасную %s",
+                self.model_name,
+                self.fallback_model,
+            )
+
+        return await self._generate_with(self.fallback_model, prompt)
 
     # -- публичный API ------------------------------------------------------- #
 

@@ -575,6 +575,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
+    if not args.verbose:
+        # Каждый запрос к Gemini печатает строку httpx и служебное сообщение
+        # SDK — на прогоне из сотни задач полезный лог в этом тонет.
+        for noisy in ("httpx", "google_genai.models", "google_genai.types"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+
     numbers = read_numbers(args)
     if not numbers:
         logger.error("Не задано ни одного номера задачи — нечего обрабатывать")
