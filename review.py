@@ -36,12 +36,15 @@ import asyncio
 import json
 import logging
 import sys
+import webbrowser
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
 from typing import Sequence
 
 from dotenv import load_dotenv
 
+from formatting import render_hints, render_html, render_plain
 from llm_processor import (
     GeminiProcessor,
     LLMError,
@@ -82,19 +85,33 @@ class ReviewResult:
 # --------------------------------------------------------------------------- #
 
 
-def format_solution(solution: TaskSolution, *, site_answer: str = "") -> str:
-    """Собрать читаемое представление разбора для терминала."""
+def format_solution(
+    solution: TaskSolution, *, site_answer: str = "", raw: bool = False
+) -> str:
+    """Собрать читаемое представление разбора для терминала.
+
+    :param raw: показать исходный Markdown с LaTeX, как его вернула модель.
+        По умолчанию текст показывается уже очищенным — ровно в том виде, в
+        каком он попадёт в админку и достанется ученику.
+    """
+    prepare = (lambda text: text) if raw else render_plain
+    hints = (
+        solution.hints
+        if raw
+        else [line for line in render_hints(solution.hints).splitlines() if line]
+    )
+
     lines = [
         "=" * WIDTH,
-        f"ЗАДАЧА {solution.task_id}",
+        f"ЗАДАЧА {solution.task_id}" + ("   [исходник модели]" if raw else ""),
         "=" * WIDTH,
         "",
         "УСЛОВИЕ:",
-        solution.condition,
+        prepare(solution.condition),
         "",
         "-" * WIDTH,
         "РЕШЕНИЕ:",
-        solution.solution_text,
+        prepare(solution.solution_text),
         "",
         "-" * WIDTH,
         f"ОТВЕТ: {solution.answer}",
@@ -103,12 +120,73 @@ def format_solution(solution: TaskSolution, *, site_answer: str = "") -> str:
         mark = "совпадает" if _same(solution.answer, site_answer) else "РАСХОЖДЕНИЕ"
         lines.append(f"Ответ сайта: {site_answer}  [{mark}]")
 
-    if solution.hints:
+    if hints:
         lines.append("")
         lines.append("ПОДСКАЗКИ:")
-        lines.extend(f"  {index}. {hint}" for index, hint in enumerate(solution.hints, 1))
+        lines.extend(f"  {index}. {hint}" for index, hint in enumerate(hints, 1))
     lines.append("=" * WIDTH)
     return "\n".join(lines)
+
+
+def build_preview(solution: TaskSolution, *, site_answer: str = "") -> str:
+    """Собрать HTML-страницу предпросмотра — вид разбора глазами ученика."""
+    answer_note = (
+        f'<p class="meta">Ответ сайта: {escape(site_answer)}</p>' if site_answer else ""
+    )
+    hints = "".join(
+        f"<li>{render_html(hint)}</li>"
+        for hint in solution.hints
+        if hint.strip()
+    )
+    return f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>Задача {escape(solution.task_id)} — предпросмотр</title>
+<style>
+  body {{ font: 16px/1.6 -apple-system, Segoe UI, Roboto, sans-serif;
+         max-width: 820px; margin: 32px auto; padding: 0 20px; color: #1a1a1a; }}
+  h1 {{ font-size: 20px; color: #666; font-weight: 500; }}
+  h2 {{ font-size: 17px; margin-top: 32px; padding-bottom: 6px;
+        border-bottom: 2px solid #e5e5e5; }}
+  pre {{ background: #f6f8fa; padding: 12px 14px; border-radius: 6px;
+         overflow-x: auto; font-size: 14px; }}
+  code {{ font-family: ui-monospace, Menlo, Consolas, monospace; }}
+  table {{ border-collapse: collapse; margin: 12px 0; }}
+  th, td {{ border: 1px solid #999; padding: 5px 14px; text-align: center;
+            min-width: 34px; }}
+  .answer {{ font-size: 18px; font-weight: 600; background: #eef7ee;
+             padding: 10px 14px; border-radius: 6px; display: inline-block; }}
+  .meta {{ color: #888; font-size: 14px; }}
+</style></head><body>
+<h1>Задача {escape(solution.task_id)} — так это увидит ученик</h1>
+<h2>Условие</h2>
+{render_html(solution.condition)}
+<h2>Решение</h2>
+{render_html(solution.solution_text)}
+<h2>Ответ</h2>
+<p><span class="answer">{escape(solution.answer)}</span></p>
+{answer_note}
+<h2>Подсказки</h2>
+<ol>{hints or "<li>нет</li>"}</ol>
+</body></html>"""
+
+
+def open_preview(
+    solution: TaskSolution, *, site_answer: str = "", directory: Path | None = None
+) -> Path:
+    """Записать предпросмотр в файл и открыть его в браузере.
+
+    :returns: путь к странице предпросмотра.
+    """
+    target = Path(directory or Path("output"))
+    target.mkdir(parents=True, exist_ok=True)
+    path = target / f"preview_{solution.task_id or 'task'}.html"
+    path.write_text(build_preview(solution, site_answer=site_answer), encoding="utf-8")
+
+    try:
+        webbrowser.open(path.resolve().as_uri())
+    except Exception as exc:  # pragma: no cover - зависит от окружения
+        logger.debug("Браузер не открылся: %s", exc)
+    return path
 
 
 def _same(left: str, right: str) -> bool:
@@ -119,6 +197,7 @@ def _same(left: str, right: str) -> bool:
 MENU = """
   п — показать разбор целиком      р — правка своей репликой
   о — правка по образцу из файла   у — уникализировать условие
+  б — предпросмотр в браузере      и — показать исходник модели
   н — откатить последнюю правку    д — принять
   х — отклонить задачу             в — выйти из прогона
 """
@@ -129,9 +208,49 @@ MENU = """
 # --------------------------------------------------------------------------- #
 
 
+def _read_line(prompt: str) -> str:
+    """Прочитать строку, не роняя прогон на битом вводе.
+
+    Вставка многострочного текста в терминал может разрезать кириллический
+    символ между чтениями — Python отвечает на это ``UnicodeDecodeError``.
+    Ронять из-за этого весь прогон (вместе с уже оплаченной работой модели)
+    нельзя, поэтому битую строку просто просим повторить.
+    """
+    while True:
+        try:
+            return input(prompt).strip()
+        except UnicodeDecodeError:
+            print("Ввод не удалось прочитать (обрезанный символ). Повторите строку.")
+
+
 async def _ask(prompt: str) -> str:
     """Спросить пользователя, не блокируя событийный цикл."""
-    return (await asyncio.to_thread(input, prompt)).strip()
+    return await asyncio.to_thread(_read_line, prompt)
+
+
+def _read_block(prompt: str) -> str:
+    """Прочитать многострочный ввод до пустой строки.
+
+    Правки естественно формулируются в несколько строк («подсказки должны быть
+    такие: 1. … 2. …»). Обычный ``input`` берёт только первую, а остальные
+    достаются следующему вопросу и выглядят как непонятные команды.
+    """
+    print(f"{prompt}\n(пустая строка — закончить ввод)")
+    lines: list[str] = []
+    while True:
+        try:
+            line = _read_line("| ")
+        except EOFError:  # ввод закончился — считаем это концом блока
+            break
+        if not line:
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+async def _ask_block(prompt: str) -> str:
+    """Спросить многострочный текст, не блокируя событийный цикл."""
+    return await asyncio.to_thread(_read_block, prompt)
 
 
 async def review_solution(
@@ -142,14 +261,19 @@ async def review_solution(
     site_answer: str = "",
     style_reference: str = "",
     auto_rewrite: bool = False,
+    preview_dir: Path | None = None,
 ) -> ReviewResult:
     """Показать разбор и дать его поправить до публикации.
+
+    Разбор показывается уже очищенным от разметки — в том виде, в каком он
+    попадёт в админку. Исходник модели доступен по отдельной команде.
 
     :param raw_text: исходный текст задачи — модель получит его как контекст
         диалога. Если пусто, берётся условие из разбора.
     :param site_answer: ответ с сайта для сверки на экране.
     :param auto_rewrite: сразу переписать условие своими словами, не дожидаясь
         команды.
+    :param preview_dir: куда складывать страницы предпросмотра.
     :returns: решение пользователя и актуальная версия разбора.
     """
     session = processor.start_session(
@@ -177,15 +301,24 @@ async def review_solution(
         if command in {"п", "p"}:
             print(format_solution(session.solution, site_answer=site_answer))
 
+        elif command in {"и", "i"}:
+            print(format_solution(session.solution, site_answer=site_answer, raw=True))
+
+        elif command in {"б", "b"}:
+            path = open_preview(
+                session.solution, site_answer=site_answer, directory=preview_dir
+            )
+            print(f"Предпросмотр открыт в браузере: {path}")
+
         elif command in {"р", "r"}:
-            instruction = await _ask("Что поправить: ")
+            instruction = await _ask_block("Что поправить:")
             if instruction:
                 await _apply(session, history, instruction)
                 print(format_solution(session.solution, site_answer=site_answer))
 
         elif command in {"о", "o"}:
-            path = await _ask("Файл с образцом: ")
-            sample = _read_sample(Path(path)) if path else ""
+            path_text = await _ask("Файл с образцом: ")
+            sample = _read_sample(Path(path_text)) if path_text else ""
             if sample:
                 instruction = (
                     await _ask("Что сделать с образцом [Enter — привести к нему]: ")
@@ -195,7 +328,9 @@ async def review_solution(
                 print(format_solution(session.solution, site_answer=site_answer))
 
         elif command in {"у", "u"}:
-            extra = await _ask("Пожелания к переписыванию [Enter — по умолчанию]: ")
+            extra = await _ask_block(
+                "Пожелания к переписыванию (пусто — по умолчанию):"
+            )
             rewritten, verified, control_answer = await _do_rewrite(
                 processor, session, history, extra
             )

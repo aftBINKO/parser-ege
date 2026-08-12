@@ -302,14 +302,23 @@ class Pipeline:
 
         # Правка и уникализация — после сверки: дальше эталона уже нет.
         if self.review or self.rewrite:
-            review_result = await review_solution(
-                self.processor,
-                solution,
-                raw_text=task.build_prompt_text(),
-                site_answer=task.site_answer,
-                style_reference=self.style_reference,
-                auto_rewrite=self.rewrite,
-            )
+            try:
+                review_result = await review_solution(
+                    self.processor,
+                    solution,
+                    raw_text=task.build_prompt_text(),
+                    site_answer=task.site_answer,
+                    style_reference=self.style_reference,
+                    auto_rewrite=self.rewrite,
+                    preview_dir=self.output_dir,
+                )
+            except (LLMError, OSError, ValueError) as exc:
+                # Разбор уже сохранён на диск — сбой просмотра не повод его терять.
+                logger.error("Задача %s: правка не удалась — %s", number, exc)
+                return TaskOutcome(
+                    number, "review", False, f"сбой при правке: {exc}",
+                    solution.answer, task.site_answer, path,
+                )
             solution = review_result.solution
             path = self._save_solution(solution)
 

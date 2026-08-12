@@ -28,13 +28,14 @@ import argparse
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from dotenv import load_dotenv
 
+from formatting import render_hints, render_plain
 from llm_processor import TaskSolution
 
 load_dotenv()
@@ -224,6 +225,8 @@ class AdminUploader:
     :param dry_run: заполнить форму, но не нажимать сохранение.
     :param timeout: таймаут ожидания элементов, сек.
     :param hints_separator: чем склеивать подсказки в одно поле.
+    :param render: очищать текст от Markdown и LaTeX перед вставкой. Выключайте,
+        только если поле админки само разбирает эту разметку.
     :param screenshot_dir: куда класть скриншоты неудачных публикаций. ``None`` —
         не делать скриншоты.
     """
@@ -238,6 +241,7 @@ class AdminUploader:
         dry_run: bool = False,
         timeout: float = 30.0,
         hints_separator: str = "\n",
+        render: bool = True,
         screenshot_dir: Path | None = None,
     ) -> None:
         if not create_url:
@@ -253,6 +257,7 @@ class AdminUploader:
         self.dry_run = dry_run
         self.timeout_ms = int(timeout * 1000)
         self.hints_separator = hints_separator
+        self.render = render
         self.screenshot_dir = Path(screenshot_dir) if screenshot_dir else None
 
         self._playwright: Any = None
@@ -480,11 +485,26 @@ class AdminUploader:
         Выпадающие списки выставляются первыми: от них в админках обычно зависит
         состав остальной формы (например, поле ответа появляется только после
         выбора типа структуры).
+
+        Текст перед вставкой очищается от Markdown и LaTeX: в поле редактора
+        это не разметка, и ученик увидел бы доллары и обратные кавычки
+        буквально. Отключается флагом ``render``.
         """
         for selector, value in self.selectors.selects.items():
             self._fill_select(selector, value)
 
-        hints = self.hints_separator.join(solution.hints)
+        if self.render:
+            condition = render_plain(solution.condition)
+            solution_text = render_plain(solution.solution_text)
+            hints = render_hints(solution.hints, separator=self.hints_separator)
+        else:
+            condition = solution.condition
+            solution_text = solution.solution_text
+            hints = self.hints_separator.join(solution.hints)
+
+        solution = replace(
+            solution, condition=condition, solution_text=solution_text
+        )
         for name, value in (
             ("task_id", solution.task_id),
             ("condition", solution.condition),
