@@ -56,11 +56,21 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 
 #: Модель по умолчанию; переопределяется переменной окружения ``GEMINI_MODEL``.
-#: Для разборов ЕГЭ важнее рассуждения, чем скорость, поэтому pro.
-DEFAULT_MODEL = "gemini-2.5-pro"
+#:
+#: Набор доступных моделей зависит от аккаунта: часть моделей закрыта для новых
+#: пользователей и отвечает 404, даже если она есть в документации. Поэтому имя
+#: модели нужно брать не из документации, а из своего аккаунта::
+#:
+#:     python llm_processor.py --list-models
+#:
+#: Для разборов ЕГЭ полезнее модель, сильная в рассуждениях: если в списке есть
+#: вариант уровня pro той же версии, укажите в .env его.
+DEFAULT_MODEL = "gemini-3.6-flash"
 
 #: Запасная модель на случай, если основная перегружена (задаётся
 #: ``GEMINI_FALLBACK_MODEL``). Пусто — запасной нет, задача просто падает.
+#: Указывать сюда модель, которой у вас нет, вредно: её 404 добавится к
+#: настоящей ошибке и запутает диагностику.
 DEFAULT_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "")
 
 #: HTTP-коды, при которых повтор осмыслен: перегрузка, лимиты, сбои сервера.
@@ -520,19 +530,29 @@ class GeminiProcessor:
         запасная модель, после исчерпания попыток запрос уходит ей.
 
         :raises LLMRequestError: не ответила ни основная модель, ни запасная.
+            В сообщении приводятся обе причины: иначе отказ запасной модели
+            затирает исходную ошибку, и непонятно, с чего всё началось.
         """
         try:
             return await self._generate_with(self.model_name, prompt)
-        except LLMRequestError:
+        except LLMRequestError as primary_error:
             if not self.fallback_model or self.fallback_model == self.model_name:
                 raise
             logger.warning(
-                "Основная модель %s недоступна — пробую запасную %s",
+                "Основная модель %s недоступна (%s) — пробую запасную %s",
                 self.model_name,
+                primary_error,
                 self.fallback_model,
             )
-
-        return await self._generate_with(self.fallback_model, prompt)
+            try:
+                return await self._generate_with(self.fallback_model, prompt)
+            except LLMRequestError as fallback_error:
+                raise LLMRequestError(
+                    f"Не ответила ни основная модель, ни запасная.\n"
+                    f"  {self.model_name}: {primary_error}\n"
+                    f"  {self.fallback_model}: {fallback_error}\n"
+                    f"Список доступных вам моделей: python llm_processor.py --list-models"
+                ) from fallback_error
 
     # -- публичный API ------------------------------------------------------- #
 
@@ -563,6 +583,32 @@ class GeminiProcessor:
         solution = parse_llm_json(raw_response, fallback_task_id=task_id)
         logger.info("Задача %s обработана", solution.task_id or "<без id>")
         return solution
+
+    def list_models(self) -> list[tuple[str, str]]:
+        """Перечислить модели, доступные этому ключу.
+
+        Набор моделей зависит от аккаунта: часть моделей закрыта для новых
+        пользователей и отвечает 404, даже если она есть в документации.
+        Поэтому имя модели надо не угадывать, а брать из этого списка.
+
+        :returns: пары ``(имя модели, описание)`` — только те, что умеют
+            генерировать содержимое.
+        :raises LLMRequestError: список получить не удалось.
+        """
+        try:
+            models = list(self._client.models.list())
+        except Exception as exc:  # SDK бросает разнородные исключения
+            raise LLMRequestError(f"Не удалось получить список моделей: {exc}") from exc
+
+        result: list[tuple[str, str]] = []
+        for model in models:
+            actions = getattr(model, "supported_actions", None) or []
+            if actions and "generateContent" not in actions:
+                continue
+            name = (getattr(model, "name", "") or "").removeprefix("models/")
+            if name:
+                result.append((name, getattr(model, "display_name", "") or ""))
+        return sorted(result)
 
     def start_session(
         self, raw_text: str, solution: TaskSolution, *, style_reference: str = ""
@@ -716,3 +762,78 @@ async def verify_rewrite(
             control.answer,
         )
     return matched, control.answer
+
+
+# --------------------------------------------------------------------------- #
+# CLI — диагностика доступа к моделям
+# --------------------------------------------------------------------------- #
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Точка входа CLI: показать доступные модели или проверить выбранную.
+
+    Набор моделей зависит от аккаунта, поэтому подбирать имя вслепую бесполезно:
+    ``--list-models`` показывает то, что доступно именно вашему ключу.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Диагностика доступа к Gemini: какие модели доступны ключу."
+    )
+    parser.add_argument(
+        "--list-models", action="store_true", help="Показать доступные модели"
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Проверить выбранную модель коротким тестовым запросом",
+    )
+    parser.add_argument("--model", default=None, help="Какую модель проверять")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("google_genai.models").setLevel(logging.WARNING)
+
+    if not args.list_models and not args.check:
+        parser.print_help()
+        return 0
+
+    try:
+        processor = GeminiProcessor(model_name=args.model)
+    except LLMError as exc:
+        logger.error("%s", exc)
+        return 1
+
+    if args.list_models:
+        try:
+            models = processor.list_models()
+        except LLMRequestError as exc:
+            logger.error("%s", exc)
+            return 1
+
+        print(f"\nДоступно моделей: {len(models)}\n" + "=" * 70)
+        for name, description in models:
+            print(f"  {name}" + (f"  — {description}" if description else ""))
+        print("=" * 70)
+        print("Выбранную модель пропишите в .env: GEMINI_MODEL=<имя>")
+        print(f"Сейчас выбрана: {processor.model_name}")
+
+    if args.check:
+        print(f"\nПроверяю модель {processor.model_name}...")
+        try:
+            solution = asyncio.run(
+                processor.process(
+                    "Сколько будет два плюс два? Ответ дай числом.", task_id="test"
+                )
+            )
+        except LLMError as exc:
+            logger.error("Модель не ответила: %s", exc)
+            return 1
+        print(f"Модель отвечает. Ответ на тестовую задачу: «{solution.answer}»")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
