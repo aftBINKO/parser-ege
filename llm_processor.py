@@ -7,11 +7,14 @@
 
 Ключевые решения:
 
-* Модель работает в режиме ``response_mime_type="application/json"`` — Gemini
-  сам гарантирует синтаксически валидный JSON, но мы всё равно не доверяем
-  ответу и парсим его защитно (см. :func:`parse_llm_json`).
-* Все сетевые вызовы асинхронные (``generate_content_async``), поэтому пачку
-  задач можно обрабатывать конкурентно через :meth:`GeminiProcessor.process_many`.
+* Используется SDK ``google-genai`` (пакет ``google-genai``, импорт
+  ``from google import genai``) — преемник закрытого ``google-generativeai``.
+* Ответ ограничен схемой (``response_schema`` + ``response_mime_type``): API сам
+  следит за набором полей и типами. Мы всё равно не доверяем ответу и парсим его
+  защитно (см. :func:`parse_llm_json`) — схема снимает частые сбои, но не
+  отменяет проверку.
+* Все сетевые вызовы асинхронные (``client.aio``), поэтому пачку задач можно
+  обрабатывать конкурентно через :meth:`GeminiProcessor.process_many`.
 * Ошибки разделены на два класса: проблема с сетью/API (:class:`LLMRequestError`)
   и проблема с содержимым ответа (:class:`LLMResponseError`). Оркестратор может
   реагировать на них по-разному.
@@ -39,8 +42,9 @@ import random
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Sequence
 
-import google.generativeai as genai
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 load_dotenv()
 
@@ -51,7 +55,8 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 
 #: Модель по умолчанию; переопределяется переменной окружения ``GEMINI_MODEL``.
-DEFAULT_MODEL = "gemini-2.5-flash"
+#: Для разборов ЕГЭ важнее рассуждения, чем скорость, поэтому pro.
+DEFAULT_MODEL = "gemini-2.5-pro"
 
 #: Поля, которые обязаны присутствовать в ответе модели.
 REQUIRED_FIELDS: tuple[str, ...] = (
@@ -99,6 +104,32 @@ SYSTEM_INSTRUCTION = """\
   в "solution_text".
 - Не добавляй в JSON никаких других полей.
 """
+
+#: Схема ответа для API. Дублирует требования системного промпта на уровне,
+#: который модель нарушить не может: набор полей, их типы и обязательность.
+RESPONSE_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    required=["task_id", "condition", "solution_text", "answer", "hints"],
+    properties={
+        "task_id": types.Schema(
+            type=types.Type.STRING, description="Идентификатор задачи"
+        ),
+        "condition": types.Schema(
+            type=types.Type.STRING, description="Очищенное условие задачи"
+        ),
+        "solution_text": types.Schema(
+            type=types.Type.STRING, description="Пошаговое решение"
+        ),
+        "answer": types.Schema(
+            type=types.Type.STRING, description="Финальный ответ без пояснений"
+        ),
+        "hints": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(type=types.Type.STRING),
+            description="Подсказки, не раскрывающие ответ",
+        ),
+    },
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -306,16 +337,14 @@ class GeminiProcessor:
         self.max_retries = max(1, max_retries)
         self.retry_base_delay = retry_base_delay
 
-        genai.configure(api_key=key)
-        self._model = genai.GenerativeModel(
-            model_name=self.model_name,
+        self._client = genai.Client(api_key=key)
+        self._config = types.GenerateContentConfig(
             system_instruction=system_instruction,
-            generation_config={
-                "temperature": temperature,
-                # Просим API отдавать именно JSON — это снимает большую часть
-                # проблем с markdown-ограждениями и болтовнёй вокруг ответа.
-                "response_mime_type": "application/json",
-            },
+            temperature=temperature,
+            # Просим API отдавать именно JSON заданной формы — это снимает
+            # markdown-ограждения, болтовню вокруг ответа и пропуск полей.
+            response_mime_type="application/json",
+            response_schema=RESPONSE_SCHEMA,
         )
         logger.debug("GeminiProcessor инициализирован (модель=%s)", self.model_name)
 
@@ -353,7 +382,9 @@ class GeminiProcessor:
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = await self._model.generate_content_async(prompt)
+                response = await self._client.aio.models.generate_content(
+                    model=self.model_name, contents=prompt, config=self._config
+                )
             except Exception as exc:  # SDK бросает разнородные исключения
                 last_error = exc
                 logger.warning(

@@ -4,7 +4,7 @@ beautifulsoup4>=4.12.0
 lxml>=5.2.0                 # быстрый парсер-бэкенд для BeautifulSoup
 
 # --- LLM (llm_processor.py) ---
-google-generativeai>=0.8.0
+google-genai>=1.0.0
 
 # --- Браузерная автоматизация (auth_state.py, uploader.py) ---
 # После установки один раз выполнить: playwright install chromium
