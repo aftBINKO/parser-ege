@@ -1,29 +1,32 @@
-"""Парсинг страницы задачи: текст условия + прикреплённые изображения.
+"""Парсинг задачи с kompege.ru: текст условия, формулы, таблицы, изображения.
 
-Модуль — первый шаг пайплайна. На вход URL задачи, на выходе :class:`ScrapedTask`
-с очищенным текстом и путями к скачанным картинкам; результат уходит дальше в
-``llm_processor.py``.
+Особенности сайта, определившие устройство модуля:
 
-Две стратегии получения HTML:
+* URL один на все задачи — ``https://kompege.ru/task``. Конкретная задача
+  открывается через форму «Поиск по номеру», поэтому входом пайплайна служит
+  **номер задачи**, а не ссылка. Отсюда же необходимость браузера: получить
+  условие простым GET нельзя.
+* Формулы отрисовывает математический движок (MathJax/KaTeX). Его загрузка по
+  умолчанию блокируется — тогда в DOM остаётся исходный LaTeX, который куда
+  полезнее для LLM, чем текст отрендеренных глифов (``∧``, ``¬``). См.
+  ``block_math_js``.
+* Условие часто содержит таблицы (например, таблицы истинности). Они
+  конвертируются в Markdown: плоская строка цифр для модели бесполезна, а
+  пустые ячейки в таких задачах значимы.
 
-* ``static``  — ``requests``: быстро, дёшево, работает, если сервер отдаёт
-  готовую разметку;
-* ``dynamic`` — синхронный Playwright: нужен, если условие дорисовывается
-  скриптами.
+Браузер поднимается один раз на весь прогон и переиспользуется между задачами —
+это на порядок быстрее, чем запускать Chromium на каждый номер::
 
-По умолчанию включён режим ``auto``: сначала пробуем ``requests``, и только если
-контейнер задачи не нашёлся или текста подозрительно мало — поднимаем браузер.
-Так в типичном случае не платим за запуск Chromium.
+    with TaskScraper() as scraper:
+        for number in ("21401", "21402"):
+            task = scraper.scrape(number)
 
-CSS-селекторы вынесены в :class:`SelectorConfig` — это плейсхолдеры, замените их
-на реальные под разметку сайта. Чтобы посмотреть разметку, удобно сдампить
-страницу::
+Playwright используется синхронный: так стабильнее и проще отлаживать. Для
+конкурентной работы из ``main.py`` есть обёртка :func:`scrape_task_async`.
 
-    python scraper.py https://kompege.ru/task?id=123 --dump-html page.html
+Отладка селекторов на реальной разметке::
 
-Модуль синхронный (``requests`` + sync Playwright — так стабильнее и проще
-отлаживать), но для конкурентной обработки пачки задач есть асинхронная обёртка
-:func:`scrape_task_async`, которая уводит работу в отдельный поток.
+    python scraper.py 21401 --dump-html page.html
 """
 
 from __future__ import annotations
@@ -32,20 +35,24 @@ import argparse
 import json
 import logging
 import mimetypes
+import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 from dotenv import load_dotenv
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+#: Страница поиска задачи (одна на все задачи).
+DEFAULT_TASK_URL = os.getenv("KOMPEGE_TASK_URL", "https://kompege.ru/task")
 
 #: Куда складывать скачанные изображения (папка в .gitignore).
 DEFAULT_IMAGE_DIR = Path("downloads")
@@ -56,15 +63,15 @@ DEFAULT_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 
-#: Если статический HTML дал меньше символов — считаем, что контент рисует JS.
-MIN_MEANINGFUL_TEXT_LEN = 40
+#: Скрипты матдвижков, которые блокируются ради исходного LaTeX в DOM.
+MATH_SCRIPT_PATTERNS = ("**/*mathjax*", "**/*MathJax*", "**/*katex*", "**/*KaTeX*")
 
 #: Предохранитель от гигантских файлов при скачивании картинок, байты.
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 
 class ScraperError(Exception):
-    """Не удалось получить или разобрать страницу задачи."""
+    """Не удалось получить или разобрать задачу."""
 
 
 # --------------------------------------------------------------------------- #
@@ -74,25 +81,30 @@ class ScraperError(Exception):
 
 @dataclass(slots=True)
 class SelectorConfig:
-    """CSS-селекторы элементов страницы задачи.
+    """Как найти элементы на странице задачи.
 
-    ЗНАЧЕНИЯ НИЖЕ — ПЛЕЙСХОЛДЕРЫ. Подставьте реальные после осмотра разметки.
+    Поиск формы намеренно идёт по видимому тексту, а не по CSS-классам: подпись
+    «Номер задачи» стабильнее сгенерированных классов. При необходимости всё
+    переопределяется.
 
-    :param container: корневой блок задачи; из него берётся текст и картинки.
-    :param text: необязательный уточняющий селектор текста внутри контейнера.
-        Если ``None`` — берётся весь текст контейнера.
-    :param images: селектор изображений внутри контейнера.
-    :param task_id: необязательный селектор элемента с ID задачи. Если ``None``
-        или элемент не найден, ID достаётся из URL.
-    :param drop: селекторы мусора, который нужно выкинуть из текста
-        (кнопки, счётчики, блок «ответ» и т.п.).
+    :param number_input_placeholder: placeholder поля ввода номера.
+    :param submit_button_text: текст кнопки отправки формы.
+    :param container_css: CSS-селектор блока с задачей. Если ``None`` — блок
+        ищется эвристикой по заголовку вида «№ 21401» (см.
+        :meth:`TaskScraper._extract_container_html`). Задайте реальный селектор,
+        когда посмотрите разметку — это надёжнее эвристики.
+    :param images: селектор изображений внутри блока задачи.
+    :param drop_css: селекторы мусора, удаляемого из текста.
+    :param drop_text: элементы, у которых текст точно совпадает с одной из этих
+        строк, удаляются целиком (кнопки-ссылки интерфейса).
     """
 
-    container: str = ".task-content"
-    text: str | None = None
+    number_input_placeholder: str = "Номер задачи"
+    submit_button_text: str = "Показать задачу"
+    container_css: str | None = None
     images: str = "img"
-    task_id: str | None = None
-    drop: tuple[str, ...] = ("script", "style", "noscript")
+    drop_css: tuple[str, ...] = ("script", "style", "noscript")
+    drop_text: tuple[str, ...] = ("Показать ответ", "Показать решение")
 
 
 # --------------------------------------------------------------------------- #
@@ -115,13 +127,12 @@ class DownloadedImage:
 
 @dataclass(slots=True)
 class ScrapedTask:
-    """Результат парсинга одной страницы — вход для ``llm_processor.py``."""
+    """Результат парсинга одной задачи — вход для ``llm_processor.py``."""
 
-    url: str
     task_id: str
     raw_text: str
+    url: str = DEFAULT_TASK_URL
     images: list[DownloadedImage] = field(default_factory=list)
-    strategy: str = "static"
 
     def to_dict(self) -> dict[str, Any]:
         """Словарь, пригодный для сериализации в JSON."""
@@ -135,7 +146,7 @@ class ScrapedTask:
 
 
 # --------------------------------------------------------------------------- #
-# Вспомогательные функции
+# Преобразование разметки в текст
 # --------------------------------------------------------------------------- #
 
 
@@ -148,23 +159,66 @@ def _normalize_whitespace(text: str) -> str:
     return text.strip()
 
 
-def extract_task_id_from_url(url: str) -> str:
-    """Достать ID задачи из URL.
+def _table_to_markdown(table: Tag) -> str:
+    """Преобразовать HTML-таблицу в Markdown.
 
-    Понимает и query-параметры (``?id=123``, ``?task_id=123``), и «красивые»
-    пути (``/task/123``). Если ничего не нашлось — возвращает пустую строку.
+    Пустые ячейки сохраняются: в таблицах истинности пропуск — часть условия,
+    и потерять его нельзя. Первая строка считается заголовком.
     """
-    parsed = urlparse(url)
-    query = parse_qs(parsed.query)
-    for key in ("id", "task_id", "taskId", "number"):
-        values = query.get(key)
-        if values and values[0].strip():
-            return values[0].strip()
+    rows: list[list[str]] = []
+    for row in table.find_all("tr"):
+        cells = row.find_all(["th", "td"])
+        if not cells:
+            continue
+        rows.append(
+            [_normalize_whitespace(cell.get_text(" ")).replace("|", "\\|") for cell in cells]
+        )
 
-    for segment in reversed([part for part in parsed.path.split("/") if part]):
-        if segment.isdigit():
-            return segment
-    return ""
+    if not rows:
+        return ""
+
+    width = max(len(row) for row in rows)
+    rows = [row + [""] * (width - len(row)) for row in rows]
+
+    lines = [
+        "| " + " | ".join(rows[0]) + " |",
+        "| " + " | ".join(["---"] * width) + " |",
+    ]
+    lines.extend("| " + " | ".join(row) + " |" for row in rows[1:])
+    return "\n".join(lines)
+
+
+def _replace_math_nodes(soup: BeautifulSoup) -> None:
+    """Вернуть формулам исходный LaTeX там, где движок уже успел отработать.
+
+    Основной путь — блокировка матскрипта (тогда LaTeX и так остаётся в DOM),
+    это подстраховка: MathJax v2 сохраняет исходник в ``<script type="math/tex">``,
+    а v3 и KaTeX прячут его в ``annotation[encoding="application/x-tex"]``.
+    """
+    for script in soup.select('script[type^="math/tex"]'):
+        latex = script.get_text().strip()
+        script.replace_with(NavigableString(f" ${latex}$ " if latex else " "))
+
+    for annotation in soup.select('annotation[encoding="application/x-tex"]'):
+        latex = annotation.get_text().strip()
+        # Заменяем весь контейнер формулы, иначе рядом останется отрендеренный вид.
+        target: Tag = annotation
+        for parent in annotation.parents:
+            if not isinstance(parent, Tag):
+                break
+            if parent.name in {"mjx-container", "math", "span"} and "katex" in " ".join(
+                parent.get("class", [])
+            ):
+                target = parent
+            elif parent.name == "mjx-container":
+                target = parent
+                break
+        target.replace_with(NavigableString(f" ${latex}$ " if latex else " "))
+
+
+# --------------------------------------------------------------------------- #
+# Прочие утилиты
+# --------------------------------------------------------------------------- #
 
 
 def _pick_image_url(tag: Tag) -> str:
@@ -194,173 +248,233 @@ def _guess_extension(url: str, content_type: str | None) -> str:
     return ".png"
 
 
+#: JS-эвристика: найти блок задачи по заголовку «№ <номер>».
+#: Берётся самый глубокий элемент с этим текстом, затем подъём вверх, пока блок
+#: не наберёт осмысленный объём — так в выборку попадает всё условие целиком.
+_CONTAINER_JS = """
+([number, minLength]) => {
+  const re = new RegExp('№\\\\s*' + number + '(\\\\D|$)');
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+  let deepest = null;
+  while (walker.nextNode()) {
+    const el = walker.currentNode;
+    if (re.test(el.textContent || '')) deepest = el;
+  }
+  if (!deepest) return null;
+  let current = deepest;
+  for (let i = 0; i < 6 && current.parentElement; i++) {
+    if ((current.textContent || '').length >= minLength) break;
+    current = current.parentElement;
+  }
+  return current.outerHTML;
+}
+"""
+
+
 # --------------------------------------------------------------------------- #
 # Скрапер
 # --------------------------------------------------------------------------- #
 
 
 class TaskScraper:
-    """Загружает и разбирает страницы задач.
+    """Открывает задачи по номеру через форму сайта и разбирает их разметку.
 
-    :param selectors: конфигурация CSS-селекторов.
-    :param strategy: ``auto`` | ``static`` | ``dynamic``.
+    :param selectors: конфигурация поиска элементов.
+    :param task_url: страница с формой поиска задачи.
     :param image_dir: куда складывать картинки.
     :param download_images: скачивать ли изображения (``False`` — только ссылки).
-    :param timeout: таймаут HTTP-запроса, сек.
-    :param request_delay: пауза между запросами, сек — вежливость к сайту.
-    :param wait_selector: что ждать в динамическом режиме; по умолчанию —
-        ``selectors.container``.
+    :param headless: запускать браузер без окна.
+    :param block_math_js: блокировать матдвижок, чтобы получить исходный LaTeX.
+    :param timeout: таймаут ожиданий Playwright, сек.
+    :param request_delay: пауза между задачами, сек — вежливость к сайту.
+    :param min_container_length: порог для эвристики поиска блока задачи.
     """
 
     def __init__(
         self,
         selectors: SelectorConfig | None = None,
         *,
-        strategy: str = "auto",
+        task_url: str = DEFAULT_TASK_URL,
         image_dir: Path = DEFAULT_IMAGE_DIR,
         download_images: bool = True,
-        timeout: float = 20.0,
+        headless: bool = True,
+        block_math_js: bool = True,
+        timeout: float = 30.0,
         request_delay: float = 1.0,
-        wait_selector: str | None = None,
+        min_container_length: int = 200,
     ) -> None:
-        if strategy not in {"auto", "static", "dynamic"}:
-            raise ValueError(f"Неизвестная стратегия: {strategy}")
-
         self.selectors = selectors or SelectorConfig()
-        self.strategy = strategy
+        self.task_url = task_url
         self.image_dir = Path(image_dir)
         self.download_images = download_images
-        self.timeout = timeout
+        self.headless = headless
+        self.block_math_js = block_math_js
+        self.timeout_ms = int(timeout * 1000)
         self.request_delay = request_delay
-        self.wait_selector = wait_selector or self.selectors.container
+        self.min_container_length = min_container_length
 
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": DEFAULT_USER_AGENT})
         self._last_request_at = 0.0
 
-    # -- получение HTML ------------------------------------------------------ #
+        self._playwright: Any = None
+        self._browser: Any = None
+        self._page: Any = None
 
-    def _throttle(self) -> None:
-        """Выдержать паузу между запросами к сайту."""
-        elapsed = time.monotonic() - self._last_request_at
-        if self._last_request_at and elapsed < self.request_delay:
-            time.sleep(self.request_delay - elapsed)
-        self._last_request_at = time.monotonic()
+    # -- жизненный цикл браузера --------------------------------------------- #
 
-    def fetch_static(self, url: str) -> str:
-        """Забрать HTML через ``requests``.
+    def open(self) -> None:
+        """Поднять браузер и открыть страницу поиска задач.
 
-        :raises ScraperError: сетевая ошибка или не-2xx ответ.
+        Вызывается лениво из :meth:`scrape`, но можно и явно.
+
+        :raises ScraperError: playwright не установлен или страница не открылась.
         """
-        self._throttle()
-        logger.debug("GET %s", url)
-        try:
-            response = self.session.get(url, timeout=self.timeout)
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            raise ScraperError(f"Не удалось загрузить {url}: {exc}") from exc
+        if self._page is not None:
+            return
 
-        # requests иногда ошибается с кодировкой кириллицы, если её нет в заголовках
-        if response.encoding and response.encoding.lower() == "iso-8859-1":
-            response.encoding = response.apparent_encoding
-        return response.text
-
-    def fetch_dynamic(self, url: str) -> str:
-        """Забрать HTML через headless-браузер (Playwright).
-
-        Импорт локальный: если сайт статический, playwright можно не ставить.
-
-        :raises ScraperError: браузер не поднялся или контент не дождались.
-        """
         try:
             from playwright.sync_api import Error as PlaywrightError
             from playwright.sync_api import sync_playwright
         except ImportError as exc:  # pragma: no cover - зависит от окружения
             raise ScraperError(
-                "Для динамического режима нужен playwright: pip install playwright"
+                "Нужен playwright: pip install playwright && playwright install chromium"
             ) from exc
 
-        self._throttle()
-        logger.debug("Открываю %s в headless-браузере", url)
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
-            page = browser.new_page(user_agent=DEFAULT_USER_AGENT)
+        self._playwright = sync_playwright().start()
+        try:
+            self._browser = self._playwright.chromium.launch(headless=self.headless)
+            self._page = self._browser.new_page(user_agent=DEFAULT_USER_AGENT)
+            self._page.set_default_timeout(self.timeout_ms)
+
+            if self.block_math_js:
+                # Без матдвижка формулы остаются в DOM исходным LaTeX.
+                for pattern in MATH_SCRIPT_PATTERNS:
+                    self._page.route(pattern, lambda route: route.abort())
+
+            logger.debug("Открываю %s", self.task_url)
+            self._page.goto(self.task_url, wait_until="domcontentloaded")
+        except PlaywrightError as exc:
+            self.close()
+            raise ScraperError(f"Не удалось открыть {self.task_url}: {exc}") from exc
+
+    def close(self) -> None:
+        """Закрыть браузер и HTTP-сессию."""
+        for resource, name in ((self._browser, "browser"), (self._playwright, "playwright")):
+            if resource is None:
+                continue
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
-                try:
-                    page.wait_for_selector(
-                        self.wait_selector, timeout=self.timeout * 1000
-                    )
-                except PlaywrightError:
-                    # Не фатально: возможно, селектор-плейсхолдер ещё не заменён.
-                    logger.warning(
-                        "Селектор '%s' не дождались на %s — разбираю что есть",
-                        self.wait_selector,
-                        url,
-                    )
-                return page.content()
-            except PlaywrightError as exc:
-                raise ScraperError(f"Playwright не смог открыть {url}: {exc}") from exc
-            finally:
-                browser.close()
+                resource.stop() if name == "playwright" else resource.close()
+            except Exception as exc:  # pragma: no cover - гасим шум при выходе
+                logger.debug("Ошибка при закрытии %s: %s", name, exc)
+        self._playwright = self._browser = self._page = None
+        self.session.close()
+
+    def __enter__(self) -> "TaskScraper":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    # -- получение разметки задачи ------------------------------------------- #
+
+    def _throttle(self) -> None:
+        """Выдержать паузу между обращениями к сайту."""
+        elapsed = time.monotonic() - self._last_request_at
+        if self._last_request_at and elapsed < self.request_delay:
+            time.sleep(self.request_delay - elapsed)
+        self._last_request_at = time.monotonic()
+
+    def _submit_number(self, number: str) -> None:
+        """Ввести номер задачи в форму и отправить её.
+
+        :raises ScraperError: форма не найдена или задача не появилась.
+        """
+        from playwright.sync_api import Error as PlaywrightError
+
+        page = self._page
+        try:
+            field = page.get_by_placeholder(self.selectors.number_input_placeholder)
+            field.wait_for(state="visible")
+            field.fill(number)
+            page.get_by_role(
+                "button", name=self.selectors.submit_button_text
+            ).first.click()
+
+            # Задача считается загруженной, когда на странице появился её номер.
+            page.wait_for_selector(rf"text=/№\s*{re.escape(number)}(\D|$)/")
+        except PlaywrightError as exc:
+            raise ScraperError(
+                f"Не удалось открыть задачу {number}: {exc}. "
+                "Проверьте SelectorConfig (подписи формы могли измениться)."
+            ) from exc
+
+    def _extract_container_html(self, number: str) -> str:
+        """Достать HTML блока задачи: по селектору, иначе эвристикой.
+
+        :raises ScraperError: блок не найден ни тем, ни другим способом.
+        """
+        page = self._page
+
+        if self.selectors.container_css:
+            node = page.query_selector(self.selectors.container_css)
+            if node is not None:
+                return node.inner_html()
+            logger.warning(
+                "Селектор '%s' не сработал — включаю эвристику по номеру задачи",
+                self.selectors.container_css,
+            )
+
+        html = page.evaluate(_CONTAINER_JS, [number, self.min_container_length])
+        if not html:
+            raise ScraperError(
+                f"Не нашёл блок задачи {number} на странице. "
+                "Задайте container_css в SelectorConfig."
+            )
+        logger.debug("Блок задачи %s найден эвристикой", number)
+        return html
 
     # -- разбор -------------------------------------------------------------- #
 
-    def _find_container(self, soup: BeautifulSoup) -> Tag | None:
-        """Найти корневой блок задачи."""
-        return soup.select_one(self.selectors.container)
+    def parse_html(self, html: str, base_url: str) -> tuple[str, list[tuple[str, str]]]:
+        """Превратить HTML блока задачи в текст и список ссылок на картинки.
 
-    def parse_html(self, html: str, url: str) -> tuple[str, list[tuple[str, str]]]:
-        """Вытащить из HTML текст условия и ссылки на изображения.
+        Порядок важен: сначала собираем изображения (пока разметка цела), затем
+        восстанавливаем формулы, затем схлопываем таблицы в Markdown и только
+        потом вытаскиваем текст.
 
         :returns: пара ``(текст, [(абсолютный_url_картинки, alt), ...])``.
-        :raises ScraperError: контейнер задачи не найден.
         """
         soup = BeautifulSoup(html, "lxml")
-        container = self._find_container(soup)
-        if container is None:
-            raise ScraperError(
-                f"Контейнер '{self.selectors.container}' не найден на {url}. "
-                "Проверьте селекторы в SelectorConfig."
-            )
 
-        # Картинки собираем до чистки текста, чтобы ничего не потерять.
         images: list[tuple[str, str]] = []
         seen: set[str] = set()
-        for tag in container.select(self.selectors.images):
+        for tag in soup.select(self.selectors.images):
             raw_src = _pick_image_url(tag)
             if not raw_src or raw_src.startswith("data:"):
                 continue
-            absolute = urljoin(url, raw_src)
+            absolute = urljoin(base_url, raw_src)
             if absolute in seen:
                 continue
             seen.add(absolute)
             alt = tag.get("alt") or ""
             images.append((absolute, alt.strip() if isinstance(alt, str) else ""))
 
-        for selector in self.selectors.drop:
-            for tag in container.select(selector):
+        _replace_math_nodes(soup)
+
+        for selector in self.selectors.drop_css:
+            for tag in soup.select(selector):
                 tag.decompose()
 
-        text_node = container
-        if self.selectors.text:
-            found = container.select_one(self.selectors.text)
-            if found is not None:
-                text_node = found
+        for tag in soup.find_all(True):
+            if tag.get_text(strip=True) in self.selectors.drop_text:
+                tag.decompose()
 
-        text = _normalize_whitespace(text_node.get_text("\n"))
-        return text, images
+        for table in soup.find_all("table"):
+            markdown = _table_to_markdown(table)
+            table.replace_with(NavigableString(f"\n\n{markdown}\n\n"))
 
-    def _resolve_task_id(self, html: str, url: str) -> str:
-        """Определить ID задачи: сначала по селектору, потом по URL."""
-        if self.selectors.task_id:
-            node = BeautifulSoup(html, "lxml").select_one(self.selectors.task_id)
-            if node is not None:
-                found = _normalize_whitespace(node.get_text(" "))
-                digits = re.search(r"\d+", found)
-                if digits:
-                    return digits.group(0)
-        return extract_task_id_from_url(url)
+        return _normalize_whitespace(soup.get_text("\n")), images
 
     # -- изображения --------------------------------------------------------- #
 
@@ -373,11 +487,8 @@ class TaskScraper:
             logger.debug("Пропускаю уже скачанное %s", destination)
             return destination
 
-        self._throttle()
         try:
-            with self.session.get(
-                image_url, timeout=self.timeout, stream=True
-            ) as response:
+            with self.session.get(image_url, timeout=30, stream=True) as response:
                 response.raise_for_status()
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 written = 0
@@ -398,7 +509,7 @@ class TaskScraper:
     def _download_all(
         self, images: Iterable[tuple[str, str]], task_id: str
     ) -> list[DownloadedImage]:
-        """Скачать все картинки задачи, именуя их по ID задачи и порядку."""
+        """Скачать все картинки задачи, именуя их по номеру задачи и порядку."""
         results: list[DownloadedImage] = []
         for index, (image_url, alt) in enumerate(images, start=1):
             extension = _guess_extension(image_url, None)
@@ -410,86 +521,51 @@ class TaskScraper:
 
     # -- публичный API ------------------------------------------------------- #
 
-    def scrape(self, url: str) -> ScrapedTask:
-        """Разобрать страницу задачи целиком.
+    def scrape(self, number: str | int) -> ScrapedTask:
+        """Открыть задачу по номеру и разобрать её.
 
-        В режиме ``auto`` при неудаче статического разбора автоматически
-        переключается на браузер.
-
-        :raises ScraperError: страницу не удалось загрузить или разобрать.
+        :param number: номер задачи, как он показан на сайте (например, 21401).
+        :raises ScraperError: задачу не удалось открыть или разобрать.
         """
-        used_strategy = self.strategy
-        html = ""
-        text = ""
-        images: list[tuple[str, str]] = []
+        number = str(number).strip()
+        if not number:
+            raise ScraperError("Пустой номер задачи")
 
-        if self.strategy in {"auto", "static"}:
-            html = self.fetch_static(url)
-            try:
-                text, images = self.parse_html(html, url)
-            except ScraperError:
-                if self.strategy == "static":
-                    raise
-                text = ""
+        self.open()
+        self._throttle()
+        self._submit_number(number)
 
-            if self.strategy == "auto" and len(text) < MIN_MEANINGFUL_TEXT_LEN:
-                logger.info(
-                    "Статический HTML %s дал %s символов — пробую браузер",
-                    url,
-                    len(text),
-                )
-                html = self.fetch_dynamic(url)
-                text, images = self.parse_html(html, url)
-                used_strategy = "dynamic"
-            else:
-                used_strategy = "static"
-        else:
-            html = self.fetch_dynamic(url)
-            text, images = self.parse_html(html, url)
-            used_strategy = "dynamic"
-
+        html = self._extract_container_html(number)
+        text, images = self.parse_html(html, self.task_url)
         if not text:
-            raise ScraperError(f"Пустой текст условия на {url}")
+            raise ScraperError(f"Пустой текст условия у задачи {number}")
 
-        task_id = self._resolve_task_id(html, url)
-        downloaded = self._download_all(images, task_id) if self.download_images else []
-
+        downloaded = self._download_all(images, number) if self.download_images else []
         logger.info(
-            "Задача %s: %s символов, картинок %s (%s)",
-            task_id or "<без id>",
-            len(text),
-            len(downloaded),
-            used_strategy,
+            "Задача %s: %s символов, картинок %s", number, len(text), len(downloaded)
         )
         return ScrapedTask(
-            url=url,
-            task_id=task_id,
-            raw_text=text,
-            images=downloaded,
-            strategy=used_strategy,
+            task_id=number, raw_text=text, url=self.task_url, images=downloaded
         )
 
-    def close(self) -> None:
-        """Закрыть HTTP-сессию."""
-        self.session.close()
-
-    def __enter__(self) -> "TaskScraper":
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.close()
+    def dump_page_html(self, number: str | int) -> str:
+        """Вернуть HTML всей страницы с открытой задачей — для подбора селекторов."""
+        self.open()
+        self._submit_number(str(number).strip())
+        return self._page.content()
 
 
-async def scrape_task_async(scraper: TaskScraper, url: str) -> ScrapedTask:
+async def scrape_task_async(scraper: TaskScraper, number: str | int) -> ScrapedTask:
     """Асинхронная обёртка над :meth:`TaskScraper.scrape`.
 
-    Сам скрапер синхронный, поэтому работа уходит в отдельный поток — это даёт
-    ``main.py`` возможность собирать задачи конкурентно через ``asyncio.gather``,
-    не переписывая модуль на aiohttp.
+    Скрапер синхронный, поэтому работа уходит в отдельный поток. Внимание: один
+    экземпляр :class:`TaskScraper` держит одну вкладку и не рассчитан на
+    параллельные вызовы — на каждый поток заводите свой экземпляр либо
+    сериализуйте обращения семафором на единицу.
     """
     import asyncio
 
-    return await asyncio.to_thread(scraper.scrape, url)
+    return await asyncio.to_thread(scraper.scrape, number)
 
 
 # --------------------------------------------------------------------------- #
@@ -500,24 +576,18 @@ async def scrape_task_async(scraper: TaskScraper, url: str) -> ScrapedTask:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Разобрать аргументы командной строки."""
     parser = argparse.ArgumentParser(
-        description="Парсинг страницы задачи: текст условия и изображения."
+        description="Парсинг задачи kompege по номеру: условие и изображения."
     )
-    parser.add_argument("url", help="URL страницы задачи")
+    parser.add_argument("number", help="Номер задачи, как на сайте (например, 21401)")
     parser.add_argument(
-        "--strategy",
-        choices=("auto", "static", "dynamic"),
-        default="auto",
-        help="Способ получения HTML (по умолчанию auto)",
+        "--task-url",
+        default=DEFAULT_TASK_URL,
+        help=f"Страница поиска задачи (по умолчанию {DEFAULT_TASK_URL})",
     )
     parser.add_argument(
         "--container",
-        default=SelectorConfig.container,
-        help="CSS-селектор блока с задачей",
-    )
-    parser.add_argument(
-        "--images-selector",
-        default=SelectorConfig.images,
-        help="CSS-селектор изображений внутри блока",
+        default=None,
+        help="CSS-селектор блока задачи (по умолчанию — эвристика по номеру)",
     )
     parser.add_argument(
         "--image-dir",
@@ -529,10 +599,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-images", action="store_true", help="Не скачивать изображения"
     )
     parser.add_argument(
+        "--headed", action="store_true", help="Показать окно браузера (отладка)"
+    )
+    parser.add_argument(
+        "--render-math",
+        action="store_true",
+        help="Не блокировать матдвижок (формулы придут отрендеренными, не LaTeX)",
+    )
+    parser.add_argument(
         "--dump-html",
         type=Path,
         default=None,
-        help="Сохранить сырой HTML страницы в файл (для подбора селекторов)",
+        help="Сохранить HTML всей страницы с открытой задачей и выйти",
     )
     return parser.parse_args(argv)
 
@@ -545,29 +623,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = _parse_args(argv)
 
-    selectors = SelectorConfig(
-        container=args.container, images=args.images_selector
-    )
     scraper = TaskScraper(
-        selectors,
-        strategy=args.strategy,
+        SelectorConfig(container_css=args.container),
+        task_url=args.task_url,
         image_dir=args.image_dir,
         download_images=not args.no_images,
+        headless=not args.headed,
+        block_math_js=not args.render_math,
     )
 
     with scraper:
-        if args.dump_html:
-            html = (
-                scraper.fetch_dynamic(args.url)
-                if args.strategy == "dynamic"
-                else scraper.fetch_static(args.url)
-            )
-            args.dump_html.write_text(html, encoding="utf-8")
-            logger.info("HTML сохранён в %s (%s байт)", args.dump_html, len(html))
-            return 0
-
         try:
-            task = scraper.scrape(args.url)
+            if args.dump_html:
+                html = scraper.dump_page_html(args.number)
+                args.dump_html.write_text(html, encoding="utf-8")
+                logger.info("HTML сохранён в %s (%s байт)", args.dump_html, len(html))
+                return 0
+            task = scraper.scrape(args.number)
         except ScraperError as exc:
             logger.error("%s", exc)
             return 1
