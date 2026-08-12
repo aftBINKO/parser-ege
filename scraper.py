@@ -16,7 +16,9 @@
   сохранением пустых ячеек — в таких задачах пропуск является частью условия;
 * формулы восстанавливаются в LaTeX, даже если разметка уже отрендерена
   движком (``annotation[encoding="application/x-tex"]``, ``script[type="math/tex"]``);
-* изображения скачиваются локально;
+* вложения скачиваются локально, а содержимое таблиц и документов (``.ods``,
+  ``.odt``, ``.txt``, ``.csv``) распаковывается модулем :mod:`attachments` и
+  подмешивается в промпт — задания 9 и 24–27 без файлов данных не решаются;
 * забирается официальный ответ сайта (тот, что прячется за «Показать ответ») —
   его можно сравнивать с ответом Gemini как страховку от галлюцинаций.
 
@@ -52,6 +54,16 @@ import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
 from dotenv import load_dotenv
 
+from attachments import (
+    DEFAULT_MAX_CHARS,
+    Attachment,
+    AttachmentError,
+    describe_attachments,
+    detect_kind,
+    extract_text,
+    rows_to_markdown,
+)
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -62,8 +74,11 @@ DEFAULT_API_URL = os.getenv("KOMPEGE_API_URL", "https://kompege.ru/api/v1")
 #: Страница поиска задачи — источник для резервного, браузерного режима.
 DEFAULT_TASK_URL = os.getenv("KOMPEGE_TASK_URL", "https://kompege.ru/task")
 
-#: Куда складывать скачанные изображения (папка в .gitignore).
-DEFAULT_IMAGE_DIR = Path("downloads")
+#: Куда складывать скачанные вложения (папка в .gitignore).
+DEFAULT_DOWNLOAD_DIR = Path("downloads")
+
+#: База для относительных ссылок на файлы задач.
+DEFAULT_FILES_BASE_URL = os.getenv("KOMPEGE_FILES_URL", "https://kompege.ru/")
 
 #: User-Agent обычного браузера: часть сайтов режет дефолтный UA requests.
 DEFAULT_USER_AGENT = (
@@ -74,8 +89,8 @@ DEFAULT_USER_AGENT = (
 #: Скрипты матдвижков, блокируемые в браузерном режиме ради исходного LaTeX.
 MATH_SCRIPT_PATTERNS = ("**/*mathjax*", "**/*MathJax*", "**/*katex*", "**/*KaTeX*")
 
-#: Предохранитель от гигантских файлов при скачивании картинок, байты.
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
+#: Предохранитель от гигантских файлов при скачивании вложений, байты.
+MAX_FILE_BYTES = 20 * 1024 * 1024
 
 
 class ScraperError(Exception):
@@ -109,6 +124,7 @@ class ApiFieldConfig:
     task_id: tuple[str, ...] = ("taskid", "task_id", "id")
     images: tuple[str, ...] = ("files", "images", "pictures", "attachments", "media")
     solution: tuple[str, ...] = ("solve_text", "solution", "explanation")
+    table: tuple[str, ...] = ("table", "tables", "grid")
 
 
 @dataclass(slots=True)
@@ -144,38 +160,49 @@ class SelectorConfig:
 
 
 @dataclass(slots=True)
-class DownloadedImage:
-    """Скачанное изображение задачи."""
-
-    url: str
-    path: Path
-    alt: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        """Словарь для сериализации (``Path`` приводится к строке)."""
-        return {"url": self.url, "path": str(self.path), "alt": self.alt}
-
-
-@dataclass(slots=True)
 class ScrapedTask:
     """Результат парсинга одной задачи — вход для ``llm_processor.py``.
 
     :param site_answer: официальный ответ с сайта. Пустая строка, если сайт его
         не отдал. Не подставляется в ответ модели: это независимая величина для
         сверки.
+    :param attachments: все вложения задачи — и картинки из условия, и файлы
+        данных (``.txt``, ``.ods``, ``.odt``, ``.csv``) из поля ``files``.
     """
 
     task_id: str
     raw_text: str
     url: str = ""
     site_answer: str = ""
-    images: list[DownloadedImage] = field(default_factory=list)
+    attachments: list[Attachment] = field(default_factory=list)
     source: str = "api"
+
+    @property
+    def images(self) -> list[Attachment]:
+        """Только картинки — их передают модели отдельно, а не текстом."""
+        return [item for item in self.attachments if item.is_image]
+
+    @property
+    def data_files(self) -> list[Attachment]:
+        """Только файлы данных: таблицы, документы, текстовые файлы."""
+        return [item for item in self.attachments if not item.is_image]
+
+    def build_prompt_text(self) -> str:
+        """Собрать текст для LLM: условие плюс содержимое файлов данных.
+
+        Модель не откроет файл по ссылке, поэтому распакованные таблицы и
+        документы подмешиваются прямо в промпт — иначе задания 9 и 24–27
+        решать не из чего.
+        """
+        block = describe_attachments(self.data_files)
+        if not block:
+            return self.raw_text
+        return f"{self.raw_text}\n\nПрикреплённые файлы:\n\n{block}"
 
     def to_dict(self) -> dict[str, Any]:
         """Словарь, пригодный для сериализации в JSON."""
         data = asdict(self)
-        data["images"] = [image.to_dict() for image in self.images]
+        data["attachments"] = [item.to_dict() for item in self.attachments]
         return data
 
     def to_json(self, *, indent: int = 2) -> str:
@@ -200,30 +227,51 @@ def _normalize_whitespace(text: str) -> str:
 def _table_to_markdown(table: Tag) -> str:
     """Преобразовать HTML-таблицу в Markdown.
 
-    Пустые ячейки сохраняются: в таблицах истинности пропуск — часть условия,
-    и потерять его нельзя. Первая строка считается заголовком.
+    Сборка Markdown общая с вложениями (:func:`attachments.rows_to_markdown`),
+    чтобы таблицы из условия и таблицы из ODS выглядели в промпте одинаково.
     """
     rows: list[list[str]] = []
     for row in table.find_all("tr"):
         cells = row.find_all(["th", "td"])
-        if not cells:
-            continue
-        rows.append(
-            [_normalize_whitespace(cell.get_text(" ")).replace("|", "\\|") for cell in cells]
-        )
+        if cells:
+            rows.append([_normalize_whitespace(cell.get_text(" ")) for cell in cells])
+    return rows_to_markdown(rows)
 
-    if not rows:
+
+def structured_table_to_markdown(table: Any) -> str:
+    """Преобразовать табличные данные из JSON в Markdown.
+
+    В ответе API есть поле ``table``; у задачи 21401 оно пустое, поэтому его
+    форма достоверно не известна. Поддерживаются оба разумных варианта — список
+    строк и объект с ключами вроде ``headers``/``rows``. Всё непонятное
+    возвращается сырым JSON, чтобы данные не потерялись молча.
+    """
+    if not table:
         return ""
 
-    width = max(len(row) for row in rows)
-    rows = [row + [""] * (width - len(row)) for row in rows]
+    if isinstance(table, dict):
+        headers = table.get("headers") or table.get("columns") or []
+        body = table.get("rows") or table.get("data") or []
+        if body:
+            rows = [[str(cell) for cell in row] for row in body if isinstance(row, list)]
+            if headers:
+                rows.insert(0, [str(cell) for cell in headers])
+            markdown = rows_to_markdown(rows)
+            if markdown:
+                return markdown
+        return json.dumps(table, ensure_ascii=False, indent=2)
 
-    lines = [
-        "| " + " | ".join(rows[0]) + " |",
-        "| " + " | ".join(["---"] * width) + " |",
-    ]
-    lines.extend("| " + " | ".join(row) + " |" for row in rows[1:])
-    return "\n".join(lines)
+    if isinstance(table, list):
+        if all(isinstance(row, list) for row in table):
+            return rows_to_markdown([[str(cell) for cell in row] for row in table])
+        if all(isinstance(row, dict) for row in table) and table:
+            headers = list(table[0].keys())
+            rows = [headers] + [
+                [str(row.get(key, "")) for key in headers] for row in table
+            ]
+            return rows_to_markdown(rows)
+
+    return json.dumps(table, ensure_ascii=False, indent=2)
 
 
 def _replace_math_nodes(soup: BeautifulSoup) -> None:
@@ -297,27 +345,57 @@ def find_field(payload: Any, names: tuple[str, ...]) -> str:
     return ""
 
 
-def find_image_urls(payload: Any, names: tuple[str, ...]) -> list[str]:
-    """Собрать ссылки на изображения из списковых полей JSON.
+def find_container(payload: Any, names: tuple[str, ...]) -> Any:
+    """Найти в JSON первое непустое составное значение (словарь или список).
 
-    Понимает и список строк, и список объектов вида ``{"url": ...}``.
+    Нужно для полей вроде ``table``, где данные лежат структурой, а не строкой.
+    Имена перебираются в порядке кортежа — как и в :func:`find_field`.
+    """
+    for name in names:
+        wanted = name.lower()
+        for node in _walk(payload):
+            for key, value in node.items():
+                if key.lower() == wanted and isinstance(value, (dict, list)) and value:
+                    return value
+    return None
+
+
+def find_attachment_refs(payload: Any, names: tuple[str, ...]) -> list[tuple[str, str]]:
+    """Собрать ссылки на вложения из списковых полей JSON.
+
+    Понимает список строк и список объектов (``{"url": ...}``,
+    ``{"name": "24-1.txt"}``). Имя файла важно не меньше ссылки: по расширению
+    определяется, как разбирать содержимое.
+
+    :returns: список пар ``(ссылка_или_имя, имя_файла)``.
     """
     wanted = {name.lower() for name in names}
-    urls: list[str] = []
+    refs: list[tuple[str, str]] = []
+
     for node in _walk(payload):
         for key, value in node.items():
             if key.lower() not in wanted or not isinstance(value, list):
                 continue
             for item in value:
                 if isinstance(item, str) and item.strip():
-                    urls.append(item.strip())
+                    reference = item.strip()
+                    refs.append((reference, Path(urlparse(reference).path).name))
                 elif isinstance(item, dict):
-                    for candidate in ("url", "src", "path", "link", "file"):
+                    reference = ""
+                    for candidate in ("url", "src", "path", "link", "file", "filename", "name"):
                         found = item.get(candidate)
                         if isinstance(found, str) and found.strip():
-                            urls.append(found.strip())
+                            reference = found.strip()
                             break
-    return urls
+                    if not reference:
+                        continue
+                    name_value = item.get("name") or item.get("filename") or ""
+                    name = (
+                        str(name_value).strip()
+                        or Path(urlparse(reference).path).name
+                    )
+                    refs.append((reference, name))
+    return refs
 
 
 # --------------------------------------------------------------------------- #
@@ -339,17 +417,23 @@ def _pick_image_url(tag: Tag) -> str:
     return ""
 
 
-def _guess_extension(url: str, content_type: str | None) -> str:
-    """Подобрать расширение файла по URL, а при неудаче — по Content-Type."""
-    suffix = Path(urlparse(url).path).suffix.lower()
-    if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"}:
-        return suffix
+def _guess_extension(url: str, name: str = "", content_type: str | None = None) -> str:
+    """Подобрать расширение файла: по имени, затем по URL, затем по Content-Type.
+
+    Расширение здесь не косметика: по нему :mod:`attachments` решает, разбирать
+    файл как таблицу, документ или текст. Поэтому неизвестный тип честно
+    остаётся без расширения, а не выдаётся за картинку.
+    """
+    for candidate in (Path(name).suffix, Path(urlparse(url).path).suffix):
+        suffix = candidate.lower()
+        if suffix and len(suffix) <= 6:
+            return suffix
 
     if content_type:
         guessed = mimetypes.guess_extension(content_type.split(";")[0].strip())
         if guessed:
             return ".jpg" if guessed == ".jpe" else guessed
-    return ".png"
+    return ""
 
 
 #: JS-эвристика браузерного режима: найти блок задачи по заголовку «№ <номер>».
@@ -386,8 +470,12 @@ class TaskScraper:
     :param task_url: страница формы — для браузерного режима и как Referer.
     :param fields: имена полей в ответе API.
     :param selectors: настройки браузерного режима.
-    :param image_dir: куда складывать картинки.
-    :param download_images: скачивать ли изображения.
+    :param download_dir: куда складывать вложения.
+    :param download_attachments: скачивать ли вложения.
+    :param extract_attachment_text: распаковывать ли содержимое таблиц и
+        документов для промпта.
+    :param max_attachment_chars: сколько символов содержимого оставлять.
+    :param files_base_url: база для относительных ссылок на файлы.
     :param fetch_answer: забирать ли официальный ответ сайта.
     :param headless: запускать браузер без окна (браузерный режим).
     :param block_math_js: блокировать матдвижок (браузерный режим).
@@ -404,8 +492,11 @@ class TaskScraper:
         task_url: str = DEFAULT_TASK_URL,
         fields: ApiFieldConfig | None = None,
         selectors: SelectorConfig | None = None,
-        image_dir: Path = DEFAULT_IMAGE_DIR,
-        download_images: bool = True,
+        download_dir: Path = DEFAULT_DOWNLOAD_DIR,
+        download_attachments: bool = True,
+        extract_attachment_text: bool = True,
+        max_attachment_chars: int = DEFAULT_MAX_CHARS,
+        files_base_url: str = DEFAULT_FILES_BASE_URL,
         fetch_answer: bool = True,
         headless: bool = True,
         block_math_js: bool = True,
@@ -421,8 +512,11 @@ class TaskScraper:
         self.task_url = task_url
         self.fields = fields or ApiFieldConfig()
         self.selectors = selectors or SelectorConfig()
-        self.image_dir = Path(image_dir)
-        self.download_images = download_images
+        self.download_dir = Path(download_dir)
+        self.download_attachments = download_attachments
+        self.extract_attachment_text = extract_attachment_text
+        self.max_attachment_chars = max_attachment_chars
+        self.files_base_url = files_base_url
         self.fetch_answer = fetch_answer
         self.headless = headless
         self.block_math_js = block_math_js
@@ -518,7 +612,8 @@ class TaskScraper:
 
         Условие может прийти как HTML или как обычный текст — распознаётся
         автоматически; HTML прогоняется через тот же разбор, что и в браузерном
-        режиме (таблицы, формулы, картинки).
+        режиме (таблицы, формулы, картинки). Табличные данные из поля ``table``
+        дописываются к условию отдельным блоком.
 
         :raises ScraperError: в ответе не нашлось текста условия.
         """
@@ -529,16 +624,24 @@ class TaskScraper:
                 "Посмотрите JSON через --dump-json и уточните ApiFieldConfig."
             )
 
-        images: list[tuple[str, str]] = []
+        refs: list[tuple[str, str, str]] = []
         if _looks_like_html(condition):
-            text, images = self.parse_html(condition, self.task_url)
+            text, refs = self.parse_html(condition, self.task_url)
         else:
             text = _normalize_whitespace(condition)
 
-        for url in find_image_urls(payload, self.fields.images):
-            absolute = urljoin(self.task_url, url)
-            if absolute not in {existing for existing, _ in images}:
-                images.append((absolute, ""))
+        structured = structured_table_to_markdown(
+            find_container(payload, self.fields.table)
+        )
+        if structured:
+            text = f"{text}\n\n{structured}"
+
+        known = {url for url, _, _ in refs}
+        for reference, name in find_attachment_refs(payload, self.fields.images):
+            absolute = urljoin(self.files_base_url, reference)
+            if absolute not in known:
+                known.add(absolute)
+                refs.append((absolute, name, ""))
 
         answer = find_field(payload, self.fields.answer) if self.fetch_answer else ""
         if self.fetch_answer and not answer:
@@ -547,14 +650,13 @@ class TaskScraper:
             answer, _ = self.parse_html(answer, self.task_url)
 
         task_id = find_field(payload, self.fields.task_id) or number
-        downloaded = self._download_all(images, number) if self.download_images else []
 
         return ScrapedTask(
             task_id=task_id,
             raw_text=text,
             url=f"{self.api_url}/task/{number}",
             site_answer=answer,
-            images=downloaded,
+            attachments=self._collect_attachments(refs, number),
             source="api",
         )
 
@@ -684,38 +786,39 @@ class TaskScraper:
         self._throttle()
         self._submit_number(number)
 
-        text, images = self.parse_html(
+        text, refs = self.parse_html(
             self._extract_container_html(number), self.task_url
         )
         if not text:
             raise ScraperError(f"Пустой текст условия у задачи {number}")
 
         answer = self._reveal_answer(number, text) if self.fetch_answer else ""
-        downloaded = self._download_all(images, number) if self.download_images else []
 
         return ScrapedTask(
             task_id=number,
             raw_text=text,
             url=self.task_url,
             site_answer=answer,
-            images=downloaded,
+            attachments=self._collect_attachments(refs, number),
             source="browser",
         )
 
     # -- разбор HTML (общий для обоих источников) ----------------------------- #
 
-    def parse_html(self, html: str, base_url: str) -> tuple[str, list[tuple[str, str]]]:
-        """Превратить HTML в текст и список ссылок на картинки.
+    def parse_html(
+        self, html: str, base_url: str
+    ) -> tuple[str, list[tuple[str, str, str]]]:
+        """Превратить HTML в текст и список ссылок на вложения.
 
         Порядок важен: сначала собираем изображения (пока разметка цела), затем
         восстанавливаем формулы, затем схлопываем таблицы в Markdown и только
         потом вытаскиваем текст.
 
-        :returns: пара ``(текст, [(абсолютный_url_картинки, alt), ...])``.
+        :returns: пара ``(текст, [(абсолютный_url, имя_файла, alt), ...])``.
         """
         soup = BeautifulSoup(html, "lxml")
 
-        images: list[tuple[str, str]] = []
+        refs: list[tuple[str, str, str]] = []
         seen: set[str] = set()
         for tag in soup.select(self.selectors.images):
             raw_src = _pick_image_url(tag)
@@ -726,7 +829,13 @@ class TaskScraper:
                 continue
             seen.add(absolute)
             alt = tag.get("alt") or ""
-            images.append((absolute, alt.strip() if isinstance(alt, str) else ""))
+            refs.append(
+                (
+                    absolute,
+                    Path(urlparse(absolute).path).name,
+                    alt.strip() if isinstance(alt, str) else "",
+                )
+            )
 
         _replace_math_nodes(soup)
 
@@ -742,12 +851,12 @@ class TaskScraper:
             markdown = _table_to_markdown(table)
             table.replace_with(NavigableString(f"\n\n{markdown}\n\n"))
 
-        return _normalize_whitespace(soup.get_text("\n")), images
+        return _normalize_whitespace(soup.get_text("\n")), refs
 
-    # -- изображения ---------------------------------------------------------- #
+    # -- вложения -------------------------------------------------------------- #
 
-    def download_image(self, image_url: str, destination: Path) -> Path | None:
-        """Скачать одно изображение.
+    def download_file(self, url: str, destination: Path) -> Path | None:
+        """Скачать один файл вложения.
 
         :returns: путь к файлу или ``None``, если скачать не удалось.
         """
@@ -756,37 +865,63 @@ class TaskScraper:
             return destination
 
         try:
-            with self.session.get(
-                image_url, timeout=self.timeout, stream=True
-            ) as response:
+            with self.session.get(url, timeout=self.timeout, stream=True) as response:
                 response.raise_for_status()
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 written = 0
                 with destination.open("wb") as handle:
                     for chunk in response.iter_content(chunk_size=64 * 1024):
                         written += len(chunk)
-                        if written > MAX_IMAGE_BYTES:
+                        if written > MAX_FILE_BYTES:
                             raise ScraperError(
-                                f"Изображение больше {MAX_IMAGE_BYTES} байт: {image_url}"
+                                f"Файл больше {MAX_FILE_BYTES} байт: {url}"
                             )
                         handle.write(chunk)
         except (requests.RequestException, ScraperError, OSError) as exc:
-            logger.warning("Не удалось скачать %s: %s", image_url, exc)
+            logger.warning("Не удалось скачать %s: %s", url, exc)
             destination.unlink(missing_ok=True)
             return None
         return destination
 
-    def _download_all(
-        self, images: Iterable[tuple[str, str]], task_id: str
-    ) -> list[DownloadedImage]:
-        """Скачать все картинки задачи, именуя их по номеру задачи и порядку."""
-        results: list[DownloadedImage] = []
-        for index, (image_url, alt) in enumerate(images, start=1):
-            extension = _guess_extension(image_url, None)
-            name = f"task_{task_id or 'unknown'}_{index}{extension}"
-            path = self.download_image(image_url, self.image_dir / name)
-            if path is not None:
-                results.append(DownloadedImage(url=image_url, path=path, alt=alt))
+    def _collect_attachments(
+        self, refs: Iterable[tuple[str, str, str]], task_id: str
+    ) -> list[Attachment]:
+        """Скачать вложения задачи и извлечь содержимое таблиц и документов.
+
+        Имя файла на диске включает номер задачи и исходное имя — иначе файлы
+        разных задач сливаются в кучу, а по имени ``24-1.txt`` не понять, чьё оно.
+        """
+        if not self.download_attachments:
+            return []
+
+        results: list[Attachment] = []
+        for index, (url, name, alt) in enumerate(refs, start=1):
+            extension = _guess_extension(url, name)
+            stem = Path(name).stem or str(index)
+            filename = f"task_{task_id or 'unknown'}_{stem}{extension}"
+            path = self.download_file(url, self.download_dir / filename)
+            if path is None:
+                continue
+
+            attachment = Attachment(
+                url=url,
+                path=path,
+                name=name or filename,
+                kind=detect_kind(name or filename),
+                alt=alt,
+            )
+
+            if self.extract_attachment_text and not attachment.is_image:
+                try:
+                    attachment.text, attachment.truncated = extract_text(
+                        path, max_chars=self.max_attachment_chars
+                    )
+                except AttachmentError as exc:
+                    # Нечитаемое вложение не повод терять задачу целиком:
+                    # файл скачан, содержимое просто не попадёт в промпт.
+                    logger.warning("Вложение %s не разобрано: %s", attachment.name, exc)
+
+            results.append(attachment)
         return results
 
     # -- публичный API -------------------------------------------------------- #
@@ -807,10 +942,11 @@ class TaskScraper:
             task = self.parse_payload(self.fetch_payload(number), number)
 
         logger.info(
-            "Задача %s: %s символов, картинок %s, ответ сайта %s (%s)",
+            "Задача %s: %s символов, картинок %s, файлов данных %s, ответ сайта %s (%s)",
             task.task_id,
             len(task.raw_text),
             len(task.images),
+            len(task.data_files),
             "есть" if task.site_answer else "нет",
             task.source,
         )
@@ -868,13 +1004,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="CSS-селектор блока задачи в браузерном режиме",
     )
     parser.add_argument(
-        "--image-dir",
+        "--download-dir",
         type=Path,
-        default=DEFAULT_IMAGE_DIR,
-        help=f"Куда сохранять картинки (по умолчанию {DEFAULT_IMAGE_DIR})",
+        default=DEFAULT_DOWNLOAD_DIR,
+        help=f"Куда сохранять вложения (по умолчанию {DEFAULT_DOWNLOAD_DIR})",
     )
     parser.add_argument(
-        "--no-images", action="store_true", help="Не скачивать изображения"
+        "--no-attachments", action="store_true", help="Не скачивать вложения"
+    )
+    parser.add_argument(
+        "--max-attachment-chars",
+        type=int,
+        default=DEFAULT_MAX_CHARS,
+        help=f"Сколько символов содержимого файла оставлять (по умолчанию {DEFAULT_MAX_CHARS})",
+    )
+    parser.add_argument(
+        "--show-prompt",
+        action="store_true",
+        help="Показать текст, который уйдёт в LLM (условие + содержимое файлов)",
     )
     parser.add_argument(
         "--no-answer", action="store_true", help="Не забирать ответ с сайта"
@@ -910,8 +1057,9 @@ def main(argv: list[str] | None = None) -> int:
         api_url=args.api_url,
         task_url=args.task_url,
         selectors=SelectorConfig(container_css=args.container),
-        image_dir=args.image_dir,
-        download_images=not args.no_images,
+        download_dir=args.download_dir,
+        download_attachments=not args.no_attachments,
+        max_attachment_chars=args.max_attachment_chars,
         fetch_answer=not args.no_answer,
         headless=not args.headed,
     )
@@ -935,7 +1083,7 @@ def main(argv: list[str] | None = None) -> int:
             logger.error("%s", exc)
             return 1
 
-    print(task.to_json())
+    print(task.build_prompt_text() if args.show_prompt else task.to_json())
     return 0
 
 
