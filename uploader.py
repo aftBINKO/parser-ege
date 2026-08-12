@@ -29,7 +29,7 @@ import json
 import logging
 import os
 import sys
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -81,12 +81,40 @@ _INSPECT_JS = """
     return '';
   };
 
-  const selectorFor = (el, index) => {
+  const baseSelectorFor = (el, index) => {
     if (el.id) return '#' + cssEscape(el.id);
     if (el.name) return `${el.tagName.toLowerCase()}[name="${el.name}"]`;
     const cls = (el.className || '').toString().trim().split(/\\s+/).filter(Boolean)[0];
     if (cls) return `${el.tagName.toLowerCase()}.${cssEscape(cls)}`;
     return `${el.tagName.toLowerCase()}:nth-of-type(${index + 1})`;
+  };
+
+  // Один и тот же селектор часто подходит нескольким элементам: три редактора
+  // Froala — все div.fr-element, кнопок button.button тоже несколько. Такой
+  // селектор бесполезен: заполнится первый попавшийся. Поэтому неоднозначные
+  // селекторы уточняем порядковым номером.
+  const selectorFor = (el, index) => {
+    const base = baseSelectorFor(el, index);
+    let matches;
+    try {
+      matches = Array.from(document.querySelectorAll(base));
+    } catch (err) {
+      return base;
+    }
+    if (matches.length <= 1) return base;
+    return `${base} >> nth=${matches.indexOf(el)}`;
+  };
+
+  // Текущее содержимое — по нему режим --detect понимает, какое поле вы
+  // заполнили руками.
+  const valueOf = (el) => {
+    const tag = el.tagName.toLowerCase();
+    if (el.getAttribute('contenteditable') === 'true') return (el.innerText || '').trim();
+    if (tag === 'select') return el.value || '';
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    if (type === 'checkbox' || type === 'radio') return el.checked ? 'да' : 'нет';
+    if (tag === 'input' || tag === 'textarea') return el.value || '';
+    return '';
   };
 
   const nodes = document.querySelectorAll(
@@ -122,6 +150,7 @@ _INSPECT_JS = """
         ? Array.from(el.options).map((o) => ({ value: o.value, label: o.text.trim() }))
         : [],
       value: tag === 'select' ? el.value : '',
+      content: valueOf(el),
     };
   }).filter((item) => item.tag !== 'input' || !['hidden'].includes(item.type));
 }
@@ -162,10 +191,15 @@ class FieldSelectors:
 
     :param task_id: поле с номером задачи. В этой админке отдельного поля под
         номер задачи с kompege нет — оставлено пустым.
-    :param condition: поле условия («Вопрос»).
-    :param solution: поле с текстом решения.
-    :param answer: поле ответа.
+    :param condition: поле условия («Вопрос»), первый редактор Froala.
+    :param solution: поле с текстом решения, второй редактор.
+    :param extra_text: поле «Доп. текст», третий редактор. Заполняется только
+        если задано; сейчас пусто.
+    :param answer: поле ответа. В осмотре формы поля с такой подписью нет —
+        похоже, ответ добавляется безымянным ``input.custom_input`` рядом с
+        кнопкой. Определите его через ``--detect`` и подставьте сюда.
     :param hints: поле подсказок (все подсказки склеиваются в одну строку).
+        Тоже не найдено осмотром — определите через ``--detect``.
     :param save_button: кнопка сохранения.
     :param success_indicator: элемент, появляющийся после успешного сохранения.
         Если пусто — успех определяется по отсутствию ошибок и тому, что
@@ -185,6 +219,7 @@ class FieldSelectors:
     task_id: str = ""
     condition: str = "div.fr-element >> nth=0"
     solution: str = "div.fr-element >> nth=1"
+    extra_text: str = ""
     answer: str = ""
     hints: str = ""
     save_button: str = 'button:has-text("Сохранить")'
@@ -440,6 +475,16 @@ class AdminUploader:
                 input(">>> Enter для осмотра формы... ")
             self._page.wait_for_timeout(300)
 
+        return self._collect_fields()
+
+    def _collect_fields(self) -> list[dict[str, Any]]:
+        """Опросить все фреймы страницы и собрать поля формы.
+
+        Вынесено отдельно, чтобы состояние формы можно было снять повторно, не
+        перезагружая страницу — на этом построен режим определения полей.
+        """
+        from playwright.sync_api import Error as PlaywrightError
+
         fields: list[dict[str, Any]] = []
         for frame in self._page.frames:
             try:
@@ -454,6 +499,40 @@ class AdminUploader:
                 item["in_iframe"] = in_iframe
                 fields.append(item)
         return fields
+
+    def detect_filled_fields(self) -> list[dict[str, Any]]:
+        """Определить поля по тому, что вы заполнили руками.
+
+        Когда поле не удаётся опознать по подписи (в форме есть безымянные
+        ``input`` без ``label``), проще пойти от обратного: снять состояние
+        формы, дать заполнить нужные поля в браузере и посмотреть, где именно
+        появилось содержимое.
+
+        :returns: поля, содержимое которых изменилось, с добавленными ключами
+            ``before`` и ``after``.
+        :raises UploaderError: страница не открылась или нет терминала.
+        """
+        before = {item["selector"]: item.get("content", "") for item in self.inspect_form()}
+
+        if not sys.stdin.isatty():
+            raise UploaderError(
+                "Режиму определения полей нужен интерактивный терминал"
+            )
+
+        print(
+            "\n>>> Заполните в открытом окне те поля, которые нужно опознать "
+            "(например, ответ и подсказки).\n"
+            ">>> Ничего не сохраняйте. Затем вернитесь сюда и нажмите Enter."
+        )
+        input(">>> Enter, когда заполните... ")
+
+        changed: list[dict[str, Any]] = []
+        for item in self._collect_fields():
+            previous = before.get(item["selector"], "")
+            current = item.get("content", "")
+            if current != previous:
+                changed.append({**item, "before": previous, "after": current})
+        return changed
 
     def _fill_select(self, selector: str, value: str) -> None:
         """Выставить значение выпадающего списка.
@@ -534,13 +613,10 @@ class AdminUploader:
             solution_text = solution.solution_text
             hints = self.hints_separator.join(solution.hints)
 
-        solution = replace(
-            solution, condition=condition, solution_text=solution_text
-        )
         for name, value in (
             ("task_id", solution.task_id),
-            ("condition", solution.condition),
-            ("solution", solution.solution_text),
+            ("condition", condition),
+            ("solution", solution_text),
             ("answer", solution.answer),
             ("hints", hints),
         ):
@@ -729,6 +805,29 @@ def parse_selects(pairs: Sequence[str]) -> dict[str, str]:
     return dict(split_select_pair(pair) for pair in pairs)
 
 
+def print_detected_fields(fields: list[dict[str, Any]]) -> None:
+    """Напечатать поля, которые вы заполнили руками, с их селекторами."""
+    if not fields:
+        print(
+            "\nНи одно поле не изменилось. Возможно, содержимое ушло в элемент, "
+            "который не является полем ввода (например, значение добавляется "
+            "кнопкой в список). Попробуйте заполнить поле и не нажимать «плюс»."
+        )
+        return
+
+    print(f"\nИзменилось полей: {len(fields)}\n" + "=" * 78)
+    for item in fields:
+        title = item["label"] or item["placeholder"] or item["name"] or "без подписи"
+        print(f"\n  {title}")
+        print(f"    селектор : {item['selector']}")
+        print(f"    было     : {item['before'] or '(пусто)'}")
+        print(f"    стало    : {item['after']}")
+        if item["rich"] or item["in_iframe"]:
+            print("    ВНИМАНИЕ : визуальный редактор — добавьте в rich_text_fields")
+    print("\n" + "=" * 78)
+    print("Перенесите селекторы в FieldSelectors (uploader.py).")
+
+
 def print_form_fields(fields: list[dict[str, Any]], *, show_all: bool = False) -> None:
     """Напечатать найденные поля формы — чтобы скопировать селекторы в конфиг.
 
@@ -851,6 +950,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "(вместе с --headed)",
     )
     parser.add_argument(
+        "--detect",
+        action="store_true",
+        help="Определить поля по вводу: заполните их в браузере, и селекторы "
+        "будут названы (вместе с --headed)",
+    )
+    parser.add_argument(
         "--create-url",
         default=DEFAULT_CREATE_URL,
         help="Страница создания задачи (по умолчанию ADMIN_CREATE_TASK_URL из .env)",
@@ -886,13 +991,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = _parse_args(argv)
 
-    if not args.inspect and args.solution is None:
-        logger.error("Укажите JSON с решением или запустите с --inspect")
+    inspecting = args.inspect or args.detect
+    if not inspecting and args.solution is None:
+        logger.error("Укажите JSON с решением или запустите с --inspect / --detect")
         return 1
+
+    if args.detect and args.headed is False:
+        logger.info("Режим определения полей удобнее с --headed")
 
     try:
         selects = parse_selects(args.select)
-        solution = None if args.inspect else load_solution(args.solution)
+        solution = None if inspecting else load_solution(args.solution)
         uploader = AdminUploader(
             create_url=args.create_url,
             state_path=args.state,
@@ -907,6 +1016,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     with uploader:
         try:
+            if args.detect:
+                print_detected_fields(uploader.detect_filled_fields())
+                return 0
             if args.inspect:
                 print_form_fields(
                     uploader.inspect_form(wait_for_user=args.wait), show_all=args.all
